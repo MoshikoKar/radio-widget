@@ -41,6 +41,8 @@
     hide: () => invoke('hide'),
     copy,
     nowPlaying: (np) => invoke('now_playing', { np }),
+    openSpotify: (query) => invoke('open_spotify', { query }),
+    onCall: (cb) => listen('call', (e) => cb(e.payload)),
     onTogglePlay: (cb) => listen('toggle-play', () => cb()),
     onMetadata: (cb) => listen('metadata', (e) => cb(e.payload)),
     onSettings: (cb) => listen('settings-changed', (e) => cb(e.payload)),

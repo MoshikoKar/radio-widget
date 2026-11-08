@@ -31,6 +31,7 @@
           <span class="logo md" id="logoBig"></span>
         </div>
         <div class="row">
+          <button class="spot-btn" id="btnSpotify" title="Open in Spotify" data-icon="spotify" hidden></button>
           <span class="text copyable" id="songText" dir="auto">—</span>
           <span class="row-icon" data-icon="note" title="Song"></span>
         </div>
@@ -68,6 +69,13 @@
           <div class="dd-panel country-panel" hidden>
             <label class="search"><span data-icon="search"></span><input type="text" spellcheck="false" placeholder="" /></label>
             <div class="dd-list flag-grid" role="listbox"></div>
+          </div>
+        </div>
+
+        <div class="dd" id="ddHistory">
+          <button class="dd-btn icon-only" id="btnHistory" title="Recently played" data-icon="history"></button>
+          <div class="dd-panel history-panel" hidden>
+            <div class="dd-list" role="listbox"></div>
           </div>
         </div>
       </div>

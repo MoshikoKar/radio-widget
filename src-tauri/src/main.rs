@@ -4,6 +4,7 @@
 // ICY song titles, and talks to the radio-browser.info directory.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod calls;
 mod http;
 mod proxy;
 
@@ -76,7 +77,10 @@ fn defaults() -> Map<String, Value> {
         "pos": {},
         "favorites": [],
         "adDuck": true,
-        "adLevel": 0.5
+        "adLevel": 0.5,
+        "callDuck": true,
+        "callLevel": 0.5,
+        "history": []
     })
     .as_object()
     .cloned()
@@ -382,15 +386,19 @@ fn set_auto_start(app: &AppHandle, on: bool) -> bool {
 
 fn update_tray(app: &AppHandle) {
     let Some(tray) = app.tray_by_id("main") else { return };
-    let (np, on_top, hotkey, ad_duck, ad_level) = {
+    let (np, on_top, hotkey, ad_duck, ad_level, call_duck, call_level) = {
         let st = app.state::<Shared>();
         let g = st.lock().unwrap();
+        let flag = |k: &str| g.settings.get(k).and_then(Value::as_bool).unwrap_or(true);
+        let level = |k: &str| g.settings.get(k).and_then(Value::as_f64).unwrap_or(0.5);
         (
             g.now_playing.clone(),
             stay_on_top(&g),
             g.hotkey,
-            g.settings.get("adDuck").and_then(Value::as_bool).unwrap_or(true),
-            g.settings.get("adLevel").and_then(Value::as_f64).unwrap_or(0.5),
+            flag("adDuck"),
+            level("adLevel"),
+            flag("callDuck"),
+            level("callLevel"),
         )
     };
     let tip: Vec<&str> = ["Radio Widget", np.station.as_str(), np.title.as_str()]
@@ -407,12 +415,9 @@ fn update_tray(app: &AppHandle) {
         let top = CheckMenuItem::with_id(app, "stayontop", "Stay on top", true, on_top, None::<&str>)?;
         let auto = CheckMenuItem::with_id(app, "autostart", "Start with Windows", true, auto_start(app), None::<&str>)?;
         let duck = CheckMenuItem::with_id(app, "adduck", "Lower volume during ads", true, ad_duck, None::<&str>)?;
-        let levels = AD_LEVELS
-            .iter()
-            .map(|&(id, label, v)| CheckMenuItem::with_id(app, id, label, ad_duck, (ad_level - v).abs() < 0.01, None::<&str>))
-            .collect::<tauri::Result<Vec<_>>>()?;
-        let level_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = levels.iter().map(|m| m as _).collect();
-        let level = Submenu::with_items(app, "Ad volume", ad_duck, &level_refs)?;
+        let level = level_menu(app, "adlevel", "Ad volume", ad_duck, ad_level)?;
+        let cduck = CheckMenuItem::with_id(app, "callduck", "Lower volume during calls", true, call_duck, None::<&str>)?;
+        let clevel = level_menu(app, "calllevel", "Call volume", call_duck, call_level)?;
         let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
         Menu::with_items(
             app,
@@ -425,6 +430,8 @@ fn update_tray(app: &AppHandle) {
                 &PredefinedMenuItem::separator(app)?,
                 &duck,
                 &level,
+                &cduck,
+                &clevel,
                 &PredefinedMenuItem::separator(app)?,
                 &quit,
             ],
@@ -435,12 +442,21 @@ fn update_tray(app: &AppHandle) {
     }
 }
 
-/// Ad volume as a share of the current volume (slider 32% at 50% → plays like 16%).
-const AD_LEVELS: [(&str, &str, f64); 3] = [
-    ("adlevel-30", "30% of current volume", 0.3),
-    ("adlevel-50", "50% of current volume", 0.5),
-    ("adlevel-70", "70% of current volume", 0.7),
-];
+/// Ad / call volume as a share of the current volume (slider 32% at 50% → plays like 16%).
+const DUCK_LEVELS: [u32; 3] = [30, 50, 70];
+
+/// "<prefix>-30" … items, the current level checked.
+fn level_menu(app: &AppHandle, prefix: &str, title: &str, enabled: bool, cur: f64) -> tauri::Result<Submenu<tauri::Wry>> {
+    let items = DUCK_LEVELS
+        .iter()
+        .map(|&p| {
+            let on = (cur * 100.0 - p as f64).abs() < 1.0;
+            CheckMenuItem::with_id(app, format!("{prefix}-{p}"), format!("{p}% of current volume"), enabled, on, None::<&str>)
+        })
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = items.iter().map(|m| m as _).collect();
+    Submenu::with_items(app, title, enabled, &refs)
+}
 
 fn set_setting(app: &AppHandle, key: &str, v: Value) {
     {
@@ -496,14 +512,18 @@ fn on_menu(app: &AppHandle, id: &str) {
                 let _ = w.emit("settings-changed", json!({ "logoOpenOn": v }));
             }
         }
-        "adduck" => {
-            let cur = app.state::<Shared>().lock().unwrap().settings.get("adDuck").and_then(Value::as_bool).unwrap_or(true);
-            set_setting(app, "adDuck", json!(!cur));
+        "adduck" | "callduck" => {
+            let key = if id == "adduck" { "adDuck" } else { "callDuck" };
+            let cur = app.state::<Shared>().lock().unwrap().settings.get(key).and_then(Value::as_bool).unwrap_or(true);
+            set_setting(app, key, json!(!cur));
         }
         "quit" => app.exit(0),
         _ => {
-            if let Some(&(_, _, v)) = AD_LEVELS.iter().find(|(lid, _, _)| *lid == id) {
-                set_setting(app, "adLevel", json!(v));
+            let level = |prefix: &str| id.strip_prefix(prefix).and_then(|p| p.parse::<u32>().ok()).filter(|p| DUCK_LEVELS.contains(p));
+            if let Some(p) = level("adlevel-") {
+                set_setting(app, "adLevel", json!(p as f64 / 100.0));
+            } else if let Some(p) = level("calllevel-") {
+                set_setting(app, "callLevel", json!(p as f64 / 100.0));
             }
         }
     }
@@ -675,6 +695,34 @@ fn hide(app: AppHandle) {
     update_tray(&app);
 }
 
+/// Opens a Spotify search for the song: in the Spotify app when it's
+/// installed (it registers the spotify: protocol), otherwise on the web.
+#[tauri::command]
+fn open_spotify(query: String) {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let q = query.trim();
+    if q.is_empty() {
+        return;
+    }
+    let enc = url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>().replace('+', "%20");
+    let has_app = unsafe {
+        let mut k = HKEY::default();
+        let ok = RegOpenKeyExW(HKEY_CLASSES_ROOT, w!("spotify"), None, KEY_READ, &mut k).is_ok();
+        if ok {
+            let _ = RegCloseKey(k);
+        }
+        ok
+    };
+    let target = if has_app { format!("spotify:search:{enc}") } else { format!("https://open.spotify.com/search/{enc}") };
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(target), None, None, SW_SHOWNORMAL);
+    }
+}
+
 #[tauri::command]
 fn now_playing(app: AppHandle, state: State<Shared>, np: NowPlaying) {
     state.lock().unwrap().now_playing = np;
@@ -727,7 +775,8 @@ fn main() {
             logo_menu,
             quit,
             hide,
-            now_playing
+            now_playing,
+            open_spotify
         ])
         .on_menu_event(|app, ev| on_menu(app, ev.id().as_ref()))
         .on_window_event(|window, event| {
@@ -751,6 +800,7 @@ fn main() {
             let handle = app.handle().clone();
             let settings = load_settings(&handle);
             let port = proxy::start(handle.clone());
+            calls::start(handle.clone());
             let on_top = settings.get("stayOnTop").and_then(Value::as_bool).unwrap_or(false);
             app.manage(LastSet(Mutex::new((None, Instant::now()))));
 

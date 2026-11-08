@@ -476,3 +476,32 @@ body.playing .eq-dot { background: #36d07a; }
 
 /* ads detected: song line becomes a "volume lowered" note (click restores) */
 body.ad-quiet #songText { font-style: italic; opacity: 0.75; }
+
+/* Spotify: icon only, next to the song and on each history row */
+.spot-btn {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  border-radius: 50%;
+  opacity: 0.8;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.15s;
+}
+.spot-btn:hover { opacity: 1; transform: scale(1.08); }
+.spot-btn:active { transform: scale(0.9); }
+.spot-btn[hidden] { display: none; }
+
+/* recently played */
+.dd-btn.icon-only { padding: 0 9px; }
+/* same size as the stations list; opaque so the card doesn't show through */
+#ddHistory .dd-panel { right: -6px; background: rgb(30, 33, 44); }
+.history-panel .dd-list { padding-top: 6px; }
+.hist-item .st-text { text-align: right; }
+.hist-item .spot-btn { opacity: 0; }
+.hist-item:hover .spot-btn { opacity: 0.85; }
+.hist-item .spot-btn:hover { opacity: 1; }
+.hist-empty { height: 80px; font-size: 13px; color: var(--muted); }

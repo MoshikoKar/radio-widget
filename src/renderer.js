@@ -131,9 +131,13 @@ function ensureGraph() {
   applyVolume();
 }
 
+// Ads / calls play at a share of the current volume: 32% at 50% → 16%.
+// Both at once don't stack — the quieter one wins.
+function duckFactor() {
+  return Math.min(adQuiet() ? adLevel() : 1, callQuiet() ? callLevel() : 1);
+}
 function applyVolume(ramp = 0.02) {
-  let v = state.muted ? 0 : state.settings.volume;
-  if (adQuiet()) v *= adLevel(); // share of the current volume: 32% at 50% → 16%
+  const v = state.muted ? 0 : state.settings.volume * duckFactor();
   if (gainNode) gainNode.gain.setTargetAtTime(v * v, actx.currentTime, ramp); // perceptual curve
   direct.volume = v * v;
 }
@@ -151,9 +155,11 @@ function play() {
   ensureGraph();
   actx.resume();
   resetAd();
+  clearTimeout(releaseTimer);
   state.streamId += 1;
   state.artist = '';
   state.song = '';
+  state.artwork = '';
   state.noInfo = false;
   clearTimeout(noInfoTimer);
   const sid = state.streamId;
@@ -192,10 +198,21 @@ function silence(a) {
   a.load(); // closes the network stream
 }
 
+// Stop = pause, so Windows' media controls keep showing the station and the
+// play key still reaches us; the connection is dropped after a while.
+const RELEASE_AFTER_MS = 5 * 60 * 1000;
+let releaseTimer = null;
 function stop() {
   resetAd();
-  silence(audio);
-  silence(direct);
+  state.streamId += 1; // ignore metadata still trickling in from the paused stream
+  audio.pause();
+  direct.pause();
+  clearTimeout(releaseTimer);
+  releaseTimer = setTimeout(() => {
+    if (state.playing) return;
+    silence(audio);
+    silence(direct);
+  }, RELEASE_AFTER_MS);
   state.playing = false;
   setPlayUI('paused');
 }
@@ -283,9 +300,32 @@ function setAdQuiet(q) {
   if (ad.quiet === q) return;
   ad.quiet = q;
   if (!q) ad.skipped = false;
-  applyVolume(0.4); // ~1s fade
+  duckChanged();
+}
+// fade (~1s) to the new level and show it on the slider + song line
+function duckChanged() {
+  if (!state.settings) return; // before boot
+  applyVolume(0.4);
+  syncVolumeUI();
   renderNowPlaying();
 }
+// The user wants to hear it (or it was a wrong guess): full volume until this
+// ad break / call is over. Used by the song-line click and by the slider.
+function liftDuck() {
+  if (adQuiet()) ad.skipped = true;
+  if (callQuiet()) call.skipped = true;
+}
+
+// ---------- calls: lower the volume while another app uses the microphone ----------
+const call = { active: false, skipped: false, apps: [] };
+const callLevel = () => Math.min(1, Math.max(0.05, Number(state.settings.callLevel) || 0.5));
+const callQuiet = () => call.active && !call.skipped && state.settings.callDuck !== false;
+window.radio.onCall(({ active, apps }) => {
+  call.active = active;
+  call.apps = apps || [];
+  if (!active) call.skipped = false; // next call ducks again
+  duckChanged();
+});
 function adStart(ms) {
   clearTimeout(ad.safetyTimer);
   ad.safetyTimer = setTimeout(adEnd, (ms ? ms + 5000 : AD_MAX_MS) + bufferLeadMs());
@@ -309,12 +349,28 @@ function resetAd() {
   if (ad.quiet) {
     ad.quiet = false;
     applyVolume();
+    syncVolumeUI();
   }
+}
+
+// iHeart streams pack extra fields into the title:
+//   Migos - text="Handsome And Wealthy" song_spot="M" length="00:03:30" amgArtworkURL="https://…" …
+// Keep "Artist - Song" and the cover URL; drop the rest.
+function parseTitle(raw) {
+  const at = raw.search(/\btext="/);
+  if (at < 0) return { title: raw, art: '' };
+  const f = {};
+  for (const [, k, v] of raw.slice(at).matchAll(/(\w+)="([^"]*)"/g)) f[k] = v;
+  const artist = raw.slice(0, at).replace(/\s*[-–]\s*$/, '').trim();
+  const song = (f.text || '').trim();
+  const art = /^https:\/\//.test(f.amgArtworkURL || '') ? f.amgArtworkURL : '';
+  return { title: artist && song ? `${artist} - ${song}` : song || artist, art };
 }
 
 window.radio.onMetadata(({ id, title, ad: adFlag, ad_ms }) => {
   if (Number(id) !== state.streamId) return;
-  const t = (title || '').trim();
+  const parsed = parseTitle((title || '').trim());
+  const t = parsed.title;
   if (adFlag || (t && isAdTitle(t))) {
     adStart(ad_ms); // the last real song stays on screen
     return;
@@ -327,6 +383,7 @@ window.radio.onMetadata(({ id, title, ad: adFlag, ad_ms }) => {
     return;
   }
   state.noInfo = false;
+  state.artwork = parsed.art;
   const i = t.indexOf(' - ');
   if (i > 0) {
     state.artist = t.slice(0, i).trim();
@@ -336,7 +393,48 @@ window.radio.onMetadata(({ id, title, ad: adFlag, ad_ms }) => {
     state.song = t;
   }
   renderNowPlaying();
+  noteForHistory();
 });
+
+// ---------- recently played ----------
+// A song is logged once it has really played for a while, so titles that
+// flash by (jingles, mis-sends, a quick station switch) stay out.
+const HISTORY_MAX = 10;
+const HISTORY_MIN_MS = 20000;
+let histPending = null;
+function history() {
+  return Array.isArray(state.settings.history) ? state.settings.history : (state.settings.history = []);
+}
+const sameSong = (a, b) => a.artist.toLowerCase() === b.artist.toLowerCase() && a.song.toLowerCase() === b.song.toLowerCase();
+function noteForHistory() {
+  const line = songLine();
+  if (histPending && histPending.line === line) return;
+  if (histPending) clearTimeout(histPending.timer);
+  histPending = null;
+  if (!line || !state.station) return;
+  const entry = { artist: state.artist, song: state.song, station: state.station.name };
+  const sid = state.streamId;
+  histPending = {
+    line,
+    // metadata arrives before the audio is heard: count from when it's audible
+    timer: setTimeout(() => {
+      histPending = null;
+      if (sid !== state.streamId || !state.playing || songLine() !== line) return;
+      const list = history().filter((h) => !sameSong(h, entry));
+      list.unshift({ ...entry, t: Date.now() });
+      state.settings.history = list.slice(0, HISTORY_MAX);
+      window.radio.save({ history: state.settings.history });
+      if (state.dropdown === 'history') renderList('history', true);
+    }, HISTORY_MIN_MS + bufferLeadMs()),
+  };
+}
+
+// ---------- Spotify ----------
+function openSpotify(artist, song) {
+  const q = [artist, song].filter(Boolean).join(' ').trim();
+  if (q) window.radio.openSpotify(q);
+}
+$('#btnSpotify').addEventListener('click', () => openSpotify(state.artist, state.song));
 
 // ---------- favorites ----------
 function favorites() {
@@ -397,11 +495,9 @@ async function copySong() {
 }
 for (const id of ['#songText', '#artistText', '#vizSmall']) {
   $(id).addEventListener('click', () => {
-    if (adQuiet()) {
-      // a wrong guess, or the user wants to hear it: full volume until this break ends
-      ad.skipped = true;
-      applyVolume(0.4);
-      renderNowPlaying();
+    if (duckFactor() < 1) {
+      liftDuck();
+      duckChanged();
       return;
     }
     copySong();
@@ -411,12 +507,18 @@ for (const id of ['#songText', '#artistText', '#vizSmall']) {
 const HE = /^he\b/i.test(navigator.language);
 const AD_TEXT = HE ? 'פרסומות · הווליום הונמך' : 'Ads · volume lowered';
 const AD_TIP = HE ? 'לחיצה מחזירה את הווליום עד סוף הפרסומות' : 'Click to restore the volume for this break';
+const CALL_TEXT = HE ? 'שיחה פעילה · הווליום הונמך' : 'On a call · volume lowered';
+const CALL_TIP = HE ? 'לחיצה (או הזזת הווליום) מחזירה את הווליום עד סוף השיחה' : 'Click (or move the volume) to restore it for this call';
 
 function renderNowPlaying() {
   const st = state.station;
   const noInfo = !!st && state.noInfo && !state.song;
-  const adShown = adQuiet();
+  const inCall = callQuiet();
+  const adShown = inCall || adQuiet();
+  const duckText = inCall ? CALL_TEXT : AD_TEXT;
+  const duckTip = inCall ? `${CALL_TIP}${call.apps.length ? `\n(${call.apps.join(', ')})` : ''}` : AD_TIP;
   body.classList.toggle('ad-quiet', adShown);
+  $('#btnSpotify').hidden = !songLine() || adShown;
   $('#stationName').textContent = st ? st.name : '—';
   $('#stationName').title = st ? st.name : '';
   syncFavUI();
@@ -430,13 +532,13 @@ function renderNowPlaying() {
   $('#artistText').textContent = state.artist || '—';
   $('#artistText').title = copyTip;
   if (adShown) {
-    $('#songText').textContent = AD_TEXT;
-    $('#songText').title = AD_TIP;
+    $('#songText').textContent = duckText;
+    $('#songText').title = duckTip;
     $('#songText').classList.add('can-copy');
   }
 
   const tip = adShown
-    ? `${AD_TEXT}\n${AD_TIP}`
+    ? `${duckText}\n${duckTip}`
     : [state.artist, state.song].filter(Boolean).join(' — ') || (st ? (noInfo ? `${st.name} · ${NO_INFO_TEXT}` : st.name) : '');
   $('#vizSmall').title = songLine() && !adShown ? `${tip}
 (click to copy)` : tip;
@@ -565,8 +667,10 @@ for (const ev of ['pointermove', 'pointerdown', 'wheel', 'keydown']) {
 document.documentElement.addEventListener('mouseleave', bumpIdle);
 
 // ---------- volume ----------
+// While ducked the slider shows what you actually hear (32% at 50% → 16%),
+// so grabbing it continues from there.
 function syncVolumeUI() {
-  const pct = Math.round((state.muted ? 0 : state.settings.volume) * 100);
+  const pct = Math.round((state.muted ? 0 : state.settings.volume * duckFactor()) * 100);
   for (const s of [$('#volBig'), $('#volSmall')]) {
     s.value = pct;
     s.style.setProperty('--val', pct + '%');
@@ -575,11 +679,16 @@ function syncVolumeUI() {
   setIcon($('#btnMuteBig'), state.muted || pct === 0 ? 'mute' : 'volume');
 }
 function onVolumeInput(e) {
+  // moving the volume during an ad / call means "I want to set it myself":
+  // the duck lets go for the rest of it, and nothing restores over the new value
+  const ducked = duckFactor() < 1;
+  if (ducked) liftDuck();
   state.settings.volume = Number(e.target.value) / 100;
   state.muted = false;
   syncVolumeUI();
   applyVolume();
   saveVolume();
+  if (ducked) renderNowPlaying();
 }
 let volSaveTimer;
 function saveVolume() {
@@ -623,12 +732,14 @@ $('#btnAuto').addEventListener('click', async () => {
 const dd = {
   stations: { root: $('#ddStations'), btn: $('#btnStations') },
   country: { root: $('#ddCountry'), btn: $('#btnCountry') },
+  history: { root: $('#ddHistory'), btn: $('#btnHistory') },
 };
 for (const k of Object.keys(dd)) {
   dd[k].panel = dd[k].root.querySelector('.dd-panel');
   dd[k].list = dd[k].root.querySelector('.dd-list');
   dd[k].input = dd[k].root.querySelector('input');
   dd[k].btn.addEventListener('click', () => (state.dropdown === k ? closeDropdown() : openDropdown(k)));
+  if (!dd[k].input) continue;
   dd[k].input.addEventListener('input', () => renderList(k));
   dd[k].input.addEventListener('keydown', (e) => listKeys(k, e));
 }
@@ -646,11 +757,11 @@ function openDropdown(kind) {
     const d = dd[kind];
     d.root.classList.add('open');
     d.panel.hidden = false;
-    d.input.value = '';
+    if (d.input) d.input.value = '';
     renderList(kind);
-    d.input.focus();
+    if (d.input) d.input.focus();
     if (kind === 'stations') loadStations();
-    else loadCountries();
+    else if (kind === 'country') loadCountries();
   });
   return ddBusy;
 }
@@ -760,11 +871,18 @@ function stationRow(s) {
 
 function renderList(kind, keepScroll = false) {
   const d = dd[kind];
-  const q = d.input.value.trim().toLowerCase();
+  const q = d.input ? d.input.value.trim().toLowerCase() : '';
   const frag = document.createDocumentFragment();
   const scroll = d.list.scrollTop;
 
-  if (kind === 'stations') {
+  if (kind === 'history') {
+    const list = history();
+    if (!list.length) {
+      const box = el('div', 'dd-state hist-empty', HE ? 'עוד לא הושמעו שירים' : 'No songs played yet');
+      return d.list.replaceChildren(box);
+    }
+    for (const h of list) frag.appendChild(historyRow(h));
+  } else if (kind === 'stations') {
     const match = (s) => !q || s.name.toLowerCase().includes(q) || (s.tags || '').toLowerCase().includes(q);
     const favs = favorites().filter(match);
     const ready = state.stationsCountry === state.settings.country;
@@ -805,6 +923,40 @@ function renderList(kind, keepScroll = false) {
   }
   d.list.replaceChildren(frag);
   d.list.scrollTop = keepScroll ? scroll : 0;
+}
+
+const timeFmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+const dayFmt = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
+function whenPlayed(t) {
+  const d = new Date(t);
+  const today = new Date().toDateString() === d.toDateString();
+  return today ? timeFmt.format(d) : `${dayFmt.format(d)} ${timeFmt.format(d)}`;
+}
+
+// click the row = copy "Artist - Song"; the Spotify icon opens it there
+function historyRow(h) {
+  const line = [h.artist, h.song].filter(Boolean).join(' - ');
+  const b = el('button', 'st-item hist-item');
+  b.title = `${line}\n(click to copy)`;
+  const txt = el('span', 'st-text');
+  const name = el('span', 'st-name', h.song);
+  name.dir = 'auto';
+  const meta = el('span', 'st-meta', [whenPlayed(h.t), h.artist, h.station].filter(Boolean).join(' · '));
+  meta.dir = 'auto';
+  txt.append(name, meta);
+  const spot = el('span', 'spot-btn');
+  spot.innerHTML = ICONS.spotify;
+  spot.title = 'Open in Spotify';
+  spot.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openSpotify(h.artist, h.song);
+  });
+  b.append(txt, spot);
+  b.addEventListener('click', async () => {
+    await window.radio.copy(line);
+    toast('✓ ' + line);
+  });
+  return b;
 }
 
 async function chooseCountry(cc) {
@@ -905,10 +1057,7 @@ window.radio.onSettings((patch) => {
   const { autoStart, ...rest } = patch;
   Object.assign(state.settings, rest);
   syncToggles(autoStart);
-  if ('adDuck' in rest || 'adLevel' in rest) {
-    applyVolume(0.4);
-    renderNowPlaying();
-  }
+  if (['adDuck', 'adLevel', 'callDuck', 'callLevel'].some((k) => k in rest)) duckChanged();
   bumpIdle();
 });
 window.radio.onTogglePlay(togglePlay);
@@ -919,6 +1068,54 @@ function reportNowPlaying() {
     title: [state.artist, state.song].filter(Boolean).join(' — '),
     playing: state.playing,
   });
+  updateMediaSession();
+}
+
+// ---------- Windows media controls (SMTC) ----------
+// WebView2 hands the Media Session to Windows: the volume flyout / lock screen
+// show the song + station, and the keyboard's media keys drive the widget.
+const ms = 'mediaSession' in navigator ? navigator.mediaSession : null;
+let msKey = '';
+function updateMediaSession() {
+  if (!ms) return;
+  const st = state.station;
+  const meta = st
+    ? {
+        title: state.song || st.name,
+        // the flyout shows only title + artist, so the station rides along here
+        artist: state.song ? [state.artist, st.name].filter(Boolean).join(' · ') : '',
+        album: st.name,
+        artwork: state.artwork ? [{ src: state.artwork }] : st.favicon ? [{ src: st.favicon }] : [],
+      }
+    : null;
+  const key = JSON.stringify(meta);
+  if (key !== msKey) {
+    msKey = key;
+    ms.metadata = meta ? new MediaMetadata(meta) : null;
+  }
+  ms.playbackState = state.playing ? 'playing' : st ? 'paused' : 'none';
+}
+// next / previous step through favorites (or the country list without favorites)
+function stepStation(dir) {
+  const list = favorites().length ? favorites() : state.stations;
+  if (!list.length) return;
+  const i = state.station ? list.findIndex((s) => s.stationuuid === state.station.stationuuid) : -1;
+  const next = list[(i + dir + list.length) % list.length];
+  if (next) setStation(next, true);
+}
+if (ms) {
+  const handlers = {
+    play: () => !state.playing && play(),
+    pause: () => state.playing && stop(),
+    stop: () => stop(),
+    nexttrack: () => stepStation(1),
+    previoustrack: () => stepStation(-1),
+  };
+  for (const [action, fn] of Object.entries(handlers)) {
+    try {
+      ms.setActionHandler(action, fn);
+    } catch {}
+  }
 }
 window.radio.onWake(() => setMode('expanded'));
 
@@ -927,6 +1124,10 @@ window.radio.onWake(() => setMode('expanded'));
   const init = await window.radio.init();
   state.settings = init.settings;
   state.proxyPort = init.proxyPort;
+  // history saved before iHeart titles were parsed
+  for (const h of history()) {
+    if (/\btext="/.test(h.song)) h.song = parseTitle(`- ${h.song}`).title;
+  }
   syncVolumeUI();
   syncToggles(init.autoStart);
   syncCountryUI();

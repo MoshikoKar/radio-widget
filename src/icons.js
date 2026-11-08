@@ -23,5 +23,10 @@ window.ICONS = {
   search: svg('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
   globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18"/>'),
   retry: svg('<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>'),
+  history: svg('<path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1L3.5 8.5"/><path d="M3.5 3.5v5h5"/><path d="M12 7.5V12l3 2"/>'),
+  spotify:
+    '<svg viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true">' +
+    '<circle cx="12" cy="12" r="10.5" fill="#1ed760"/>' +
+    '<path d="M6.6 9.3Q12 7.5 17.6 10.2M7.3 12.5Q12 11 16.5 13.3M8 15.6Q12 14.5 15.4 16.1" fill="none" stroke="#121212" stroke-width="1.7" stroke-linecap="round"/></svg>',
   warn: svg('<path d="M12 3 2 20h20z"/><path d="M12 10v4"/><path d="M12 17h.01"/>'),
 };
