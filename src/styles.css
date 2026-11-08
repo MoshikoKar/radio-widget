@@ -497,8 +497,9 @@ body.ad-quiet #songText { font-style: italic; opacity: 0.75; }
 
 /* recently played */
 .dd-btn.icon-only { padding: 0 9px; }
-/* same size as the stations list; opaque so the card doesn't show through */
-#ddHistory .dd-panel { right: -6px; background: rgb(30, 33, 44); }
+/* as tall as its songs (up to the stations list's height); opaque, since a
+   short list sits over the song info and it mustn't show through */
+#ddHistory .dd-panel { right: -6px; height: auto; max-height: 296px; background: rgb(30, 33, 44); }
 .history-panel .dd-list { padding-top: 6px; }
 .hist-item .st-text { text-align: right; }
 .hist-item .spot-btn { opacity: 0; }

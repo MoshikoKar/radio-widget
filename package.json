@@ -1,6 +1,6 @@
 {
   "name": "radio-widget",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "description": "Radio widget for Windows (Tauri)",
   "scripts": {
