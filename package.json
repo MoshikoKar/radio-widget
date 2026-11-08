@@ -1,0 +1,13 @@
+{
+  "name": "radio-widget",
+  "version": "0.5.0",
+  "private": true,
+  "description": "Radio widget for Windows (Tauri)",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

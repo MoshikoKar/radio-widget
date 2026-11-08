@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Radio</title>
+  <link rel="stylesheet" href="flags/flags.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body data-mode="expanded">
+
+  <!-- ================= EXPANDED ================= -->
+  <section id="expanded" class="card">
+    <header class="titlebar">
+      <span class="live" id="liveDot" title="Live"></span>
+      <div class="titlebar-actions">
+        <button class="icon-btn sm" id="btnCollapse" title="Compact" data-icon="minimize"></button>
+        <button class="icon-btn sm danger" id="btnClose" title="Hide (keeps playing; quit from the tray icon)" data-icon="close"></button>
+      </div>
+    </header>
+
+    <div class="main">
+      <div class="left">
+        <canvas id="vizBig" class="viz"></canvas>
+        <button class="play-btn" id="btnPlayBig" title="Play"><span data-icon="play"></span></button>
+      </div>
+
+      <div class="info">
+        <div class="row station-row">
+          <button class="fav-btn" id="btnFav" title="Add to favorites" aria-pressed="false" data-icon="star"></button>
+          <span class="station-name" id="stationName" dir="auto">—</span>
+          <span class="logo md" id="logoBig"></span>
+        </div>
+        <div class="row">
+          <span class="text copyable" id="songText" dir="auto">—</span>
+          <span class="row-icon" data-icon="note" title="Song"></span>
+        </div>
+        <div class="row">
+          <span class="text muted copyable" id="artistText" dir="auto">—</span>
+          <span class="row-icon" data-icon="mic" title="Artist"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="bar">
+      <div class="volume">
+        <button class="icon-btn sm" id="btnMuteBig" title="Mute" data-icon="volume"></button>
+        <input type="range" id="volBig" class="slider" min="0" max="100" value="70" title="Volume" />
+      </div>
+
+      <div class="bar-right">
+        <button class="toggle pin" id="btnPin" title="Stay on top" aria-pressed="false" data-icon="pin"></button>
+        <button class="toggle win" id="btnAuto" title="Start with Windows" aria-pressed="false" data-icon="windows"></button>
+
+        <div class="dd" id="ddStations">
+          <button class="dd-btn" id="btnStations" title="Stations">
+            <span data-icon="radio"></span><span class="chev" data-icon="chevron"></span>
+          </button>
+          <div class="dd-panel stations-panel" hidden>
+            <label class="search"><span data-icon="search"></span><input type="text" spellcheck="false" placeholder="" /></label>
+            <div class="dd-list" role="listbox"></div>
+          </div>
+        </div>
+
+        <div class="dd" id="ddCountry">
+          <button class="dd-btn" id="btnCountry" title="Country">
+            <span class="flag" id="countryFlag"></span><span class="chev" data-icon="chevron"></span>
+          </button>
+          <div class="dd-panel country-panel" hidden>
+            <label class="search"><span data-icon="search"></span><input type="text" spellcheck="false" placeholder="" /></label>
+            <div class="dd-list flag-grid" role="listbox"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= COMPACT ================= -->
+  <section id="compact" class="card">
+    <button class="icon-btn sm" id="btnExpand" title="Expand" data-icon="maximize"></button>
+    <input type="range" id="volSmall" class="slider" min="0" max="100" value="70" title="Volume" />
+    <canvas id="vizSmall" class="viz"></canvas>
+    <button class="logo-btn" id="btnLogoSmall" title="Stations"><span class="logo sm" id="logoSmall"></span></button>
+    <button class="play-btn sm" id="btnPlaySmall" title="Play"><span data-icon="play"></span></button>
+  </section>
+
+  <!-- ================= STAY-ON-TOP (logo only) ================= -->
+  <section id="logoView">
+    <div class="logo-tile"><span class="logo lg" id="logoTile"></span><span class="eq-dot"></span></div>
+  </section>
+
+  <script src="bridge.js"></script>
+  <script src="icons.js"></script>
+  <script src="renderer.js"></script>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

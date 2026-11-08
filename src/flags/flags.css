@@ -1,0 +1,10 @@
+.fi{background-size:contain;background-position:50%;background-repeat:no-repeat;position:relative;display:inline-block;width:1.333333em;line-height:1em}
+.fi:before{content:" "}
+.fi-il{background-image:url(il.svg)}
+.fi-us{background-image:url(us.svg)}
+.fi-gb{background-image:url(gb.svg)}
+.fi-ca{background-image:url(ca.svg)}
+.fi-au{background-image:url(au.svg)}
+.fi-ie{background-image:url(ie.svg)}
+.fi-nz{background-image:url(nz.svg)}
+.fi-za{background-image:url(za.svg)}
