@@ -131,9 +131,10 @@ function ensureGraph() {
   applyVolume();
 }
 
-function applyVolume() {
-  const v = state.muted ? 0 : state.settings.volume;
-  if (gainNode) gainNode.gain.setTargetAtTime(v * v, actx.currentTime, 0.02); // perceptual curve
+function applyVolume(ramp = 0.02) {
+  let v = state.muted ? 0 : state.settings.volume;
+  if (adQuiet()) v *= adLevel();
+  if (gainNode) gainNode.gain.setTargetAtTime(v * v, actx.currentTime, ramp); // perceptual curve
   direct.volume = v * v;
 }
 
@@ -149,6 +150,7 @@ function play() {
   }
   ensureGraph();
   actx.resume();
+  resetAd();
   state.streamId += 1;
   state.artist = '';
   state.song = '';
@@ -191,6 +193,7 @@ function silence(a) {
 }
 
 function stop() {
+  resetAd();
   silence(audio);
   silence(direct);
   state.playing = false;
@@ -241,14 +244,82 @@ const NO_INFO_TEXT = /^he\b/i.test(navigator.language) ? 'התחנה לא משד
 // Filler that some CDNs put in StreamTitle instead of a real song
 function isFillerTitle(t) {
   if (!t) return true;
-  if (/powered by|streaming|^cdn\b|^unknown$|^n\/a$|^-+$|advertis|^live$/i.test(t)) return true;
+  if (/powered by|streaming|^cdn\b|^unknown$|^n\/a$|^-+$|^live$/i.test(t) || isAdTitle(t)) return true;
   const st = state.station && state.station.name.toLowerCase();
   return !!st && t.toLowerCase() === st;
 }
 
-window.radio.onMetadata(({ id, title }) => {
+// ---------- ads: lower the volume while the station says an ad is on ----------
+// Only explicit signals count: the ad server's own marker (adw_ad, parsed by the
+// proxy) or a title that is nothing but "Advertisement" / "פרסומת" etc. A missing
+// title, the station name, or talk never count — talk stations and DJ breaks
+// would be hit otherwise.
+const AD_WORDS =
+  /^(advertisements?|advert|ads|commercials?|commercial break|ad ?break|spot ?block|sponsored|פרסומת|פרסומות|תשדיר|תשדירים|תשדירי פרסומת|פרסומות ותשדירים)$/i;
+function isAdTitle(t) {
+  const s = t.trim();
+  if (AD_WORDS.test(s)) return true;
+  // "Advertisement - 103FM" / "103FM - פרסומות". Not "Artist - <song titled Ads>":
+  // an ad word in the song slot counts only when the other side is the station.
+  const parts = s.split(/\s+[-–—|:]\s+/).map((x) => x.trim());
+  if (parts.length !== 2) return false;
+  const st = ((state.station && state.station.name) || '').toLowerCase();
+  const isStation = (x) => !!st && !!x && (st.includes(x.toLowerCase()) || x.toLowerCase().includes(st));
+  return AD_WORDS.test(parts[0]) || (AD_WORDS.test(parts[1]) && isStation(parts[0]));
+}
+const AD_MAX_MS = 6 * 60 * 1000; // never stay quiet longer than this without a new ad marker
+const ad = { on: false, quiet: false, skipped: false, switchTimer: null, safetyTimer: null };
+const adLevel = () => Math.min(1, Math.max(0.05, Number(state.settings.adLevel) || 0.5));
+const adQuiet = () => ad.quiet && !ad.skipped && state.settings.adDuck !== false;
+
+// The proxy reads metadata as the bytes arrive, but we hear them only after the
+// player's buffer drains — wait that long so a song's tail isn't cut.
+function bufferLeadMs() {
+  const b = audio.buffered;
+  if (!state.usingProxy || !b.length) return 0;
+  return Math.min(20000, Math.max(0, (b.end(b.length - 1) - audio.currentTime) * 1000));
+}
+function setAdQuiet(q) {
+  if (ad.quiet === q) return;
+  ad.quiet = q;
+  if (!q) ad.skipped = false;
+  applyVolume(0.4); // ~1s fade
+  renderNowPlaying();
+}
+function adStart(ms) {
+  clearTimeout(ad.safetyTimer);
+  ad.safetyTimer = setTimeout(adEnd, (ms ? ms + 5000 : AD_MAX_MS) + bufferLeadMs());
+  if (ad.on) return;
+  ad.on = true;
+  clearTimeout(ad.switchTimer);
+  ad.switchTimer = setTimeout(() => setAdQuiet(true), bufferLeadMs());
+}
+function adEnd() {
+  clearTimeout(ad.safetyTimer);
+  if (!ad.on) return;
+  ad.on = false;
+  clearTimeout(ad.switchTimer);
+  ad.switchTimer = setTimeout(() => setAdQuiet(false), bufferLeadMs());
+}
+function resetAd() {
+  clearTimeout(ad.switchTimer);
+  clearTimeout(ad.safetyTimer);
+  ad.on = false;
+  ad.skipped = false;
+  if (ad.quiet) {
+    ad.quiet = false;
+    applyVolume();
+  }
+}
+
+window.radio.onMetadata(({ id, title, ad: adFlag, ad_ms }) => {
   if (Number(id) !== state.streamId) return;
   const t = (title || '').trim();
+  if (adFlag || (t && isAdTitle(t))) {
+    adStart(ad_ms); // the last real song stays on screen
+    return;
+  }
+  if (title != null) adEnd(); // any new non-ad metadata means the break is over
   if (isFillerTitle(t)) {
     // keep the last real song if the station only sent filler between songs
     if (!state.song) state.noInfo = true;
@@ -324,11 +395,28 @@ async function copySong() {
   await window.radio.copy(line);
   toast('✓ ' + line);
 }
-for (const id of ['#songText', '#artistText', '#vizSmall']) $(id).addEventListener('click', copySong);
+for (const id of ['#songText', '#artistText', '#vizSmall']) {
+  $(id).addEventListener('click', () => {
+    if (adQuiet()) {
+      // a wrong guess, or the user wants to hear it: full volume until this break ends
+      ad.skipped = true;
+      applyVolume(0.4);
+      renderNowPlaying();
+      return;
+    }
+    copySong();
+  });
+}
+
+const HE = /^he\b/i.test(navigator.language);
+const AD_TEXT = HE ? 'פרסומות · הווליום הונמך' : 'Ads · volume lowered';
+const AD_TIP = HE ? 'לחיצה מחזירה את הווליום עד סוף הפרסומות' : 'Click to restore the volume for this break';
 
 function renderNowPlaying() {
   const st = state.station;
   const noInfo = !!st && state.noInfo && !state.song;
+  const adShown = adQuiet();
+  body.classList.toggle('ad-quiet', adShown);
   $('#stationName').textContent = st ? st.name : '—';
   $('#stationName').title = st ? st.name : '';
   syncFavUI();
@@ -341,10 +429,16 @@ function renderNowPlaying() {
   $('#artistText').classList.toggle('can-copy', !!songLine());
   $('#artistText').textContent = state.artist || '—';
   $('#artistText').title = copyTip;
+  if (adShown) {
+    $('#songText').textContent = AD_TEXT;
+    $('#songText').title = AD_TIP;
+    $('#songText').classList.add('can-copy');
+  }
 
-  const tip =
-    [state.artist, state.song].filter(Boolean).join(' — ') || (st ? (noInfo ? `${st.name} · ${NO_INFO_TEXT}` : st.name) : '');
-  $('#vizSmall').title = songLine() ? `${tip}
+  const tip = adShown
+    ? `${AD_TEXT}\n${AD_TIP}`
+    : [state.artist, state.song].filter(Boolean).join(' — ') || (st ? (noInfo ? `${st.name} · ${NO_INFO_TEXT}` : st.name) : '');
+  $('#vizSmall').title = songLine() && !adShown ? `${tip}
 (click to copy)` : tip;
   $('#btnLogoSmall').title = st ? st.name : 'Stations';
   $('#logoView').title = st ? [st.name, tip !== st.name ? tip : ''].filter(Boolean).join('\n') : '';
@@ -811,6 +905,10 @@ window.radio.onSettings((patch) => {
   const { autoStart, ...rest } = patch;
   Object.assign(state.settings, rest);
   syncToggles(autoStart);
+  if ('adDuck' in rest || 'adLevel' in rest) {
+    applyVolume(0.4);
+    renderNowPlaying();
+  }
   bumpIdle();
 });
 window.radio.onTogglePlay(togglePlay);

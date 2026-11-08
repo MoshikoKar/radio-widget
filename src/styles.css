@@ -473,3 +473,6 @@ body.playing .eq-dot { background: #36d07a; }
   z-index: 50;
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ads detected: song line becomes a "volume lowered" note (click restores) */
+body.ad-quiet #songText { font-style: italic; opacity: 0.75; }

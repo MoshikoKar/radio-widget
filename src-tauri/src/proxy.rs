@@ -2,7 +2,8 @@
 //!
 //! The UI plays `http://127.0.0.1:<port>/stream?id=<n>&u=<stream url>`. We ask
 //! the station for ICY metadata (`Icy-MetaData: 1`), strip the metadata blocks
-//! out of the audio, and emit `StreamTitle` to the UI as a `metadata` event.
+//! out of the audio, and emit `StreamTitle` to the UI as a `metadata` event,
+//! along with any explicit ad marker the station's ad server inserted.
 //! The response carries CORS headers so the Web Audio visualizer can read it.
 
 use crate::http;
@@ -18,6 +19,10 @@ use tauri::{AppHandle, Emitter};
 struct Meta {
     id: String,
     title: Option<String>,
+    /// the station explicitly flagged this block as an ad (AdsWizz `adw_ad`)
+    ad: bool,
+    /// announced ad length, when the ad server gives one
+    ad_ms: Option<u64>,
 }
 
 /// Starts the proxy and returns its port.
@@ -75,11 +80,11 @@ fn handle(mut client: TcpStream, app: AppHandle, gen: Arc<AtomicU64>) -> std::io
         "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
     )?;
 
-    let send = |title: Option<String>| {
-        let _ = app.emit("metadata", Meta { id: id.clone(), title });
+    let send = |title: Option<String>, ad: bool, ad_ms: Option<u64>| {
+        let _ = app.emit("metadata", Meta { id: id.clone(), title, ad, ad_ms });
     };
     if metaint == 0 {
-        send(None);
+        send(None, false, None);
     }
 
     let mut body = resp.body;
@@ -139,8 +144,11 @@ fn handle(mut client: TcpStream, app: AppHandle, gen: Arc<AtomicU64>) -> std::io
                     meta_len -= k;
                     i += k;
                     if meta_len == 0 {
-                        if let Some(t) = stream_title(&decode(&meta)) {
-                            send(Some(t));
+                        let fields = parse_fields(&decode(&meta));
+                        let (ad, ad_ms) = ad_marker(&fields);
+                        let title = field(&fields, "StreamTitle").map(|t| t.trim().to_string());
+                        if title.is_some() || ad {
+                            send(title, ad, ad_ms);
                         }
                         st = St::Audio;
                         remaining = metaint;
@@ -173,9 +181,88 @@ fn decode(raw: &[u8]) -> String {
     }
 }
 
-fn stream_title(meta: &str) -> Option<String> {
-    let start = meta.find("StreamTitle='")? + "StreamTitle='".len();
-    let rest = &meta[start..];
-    let end = rest.find("';").unwrap_or(rest.len());
-    Some(rest[..end].trim().to_string())
+/// ICY metadata is `Key='value';Key2='value2';`. Values may contain quotes
+/// (`Don't Stop`), so a value only ends at `';` followed by the next key or the end.
+fn parse_fields(meta: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = meta;
+    while let Some(eq) = rest.find("='") {
+        let key = rest[..eq].trim_matches(|c: char| c == ';' || c.is_whitespace()).to_string();
+        let after = &rest[eq + 2..];
+        let mut end = after.len();
+        let mut from = 0;
+        while let Some(p) = after[from..].find("';") {
+            let at = from + p;
+            let next = &after[at + 2..];
+            let next_is_key = next.trim().is_empty()
+                || next.find("='").is_some_and(|k| next[..k].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+            if next_is_key {
+                end = at;
+                break;
+            }
+            from = at + 2;
+        }
+        let value = after[..end].trim_end_matches('\'').to_string();
+        out.push((key, value));
+        rest = after.get(end + 2..).unwrap_or("");
+    }
+    out
+}
+
+fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
+}
+
+/// Explicit ad markers only — never guessed from the audio or from a missing title.
+/// AdsWizz-served streams send `adw_ad='true'` (sometimes inside StreamUrl's
+/// query string) together with `durationMilliseconds`.
+fn ad_marker(fields: &[(String, String)]) -> (bool, Option<u64>) {
+    let truthy = |v: &str| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes");
+    let mut ad = field(fields, "adw_ad").is_some_and(truthy);
+    let mut ms = field(fields, "durationMilliseconds").and_then(|v| v.trim().parse().ok());
+    if let Some(u) = field(fields, "StreamUrl") {
+        if let Ok(parsed) = url::Url::parse(u) {
+            for (k, v) in parsed.query_pairs() {
+                if k.eq_ignore_ascii_case("adw_ad") && truthy(&v) {
+                    ad = true;
+                }
+                if k.eq_ignore_ascii_case("durationMilliseconds") && ms.is_none() {
+                    ms = v.trim().parse().ok();
+                }
+            }
+        }
+    }
+    (ad, if ad { ms.filter(|&m| m > 0 && m < 10 * 60 * 1000) } else { None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_titles_with_quotes() {
+        let f = parse_fields("StreamTitle='Toto - Don't Stop';StreamUrl='';");
+        assert_eq!(field(&f, "StreamTitle"), Some("Toto - Don't Stop"));
+        assert_eq!(field(&f, "StreamUrl"), Some(""));
+    }
+
+    #[test]
+    fn detects_adswizz_fields() {
+        let f = parse_fields("StreamTitle='';StreamUrl='';adw_ad='true';durationMilliseconds='30040';adId='123';insertionType='midroll';");
+        assert_eq!(ad_marker(&f), (true, Some(30040)));
+    }
+
+    #[test]
+    fn detects_adswizz_in_stream_url() {
+        let f = parse_fields("StreamTitle='Brand';StreamUrl='http://x.example/a?adw_ad=true&durationMilliseconds=15000';");
+        assert_eq!(ad_marker(&f), (true, Some(15000)));
+    }
+
+    #[test]
+    fn plain_song_is_not_an_ad() {
+        let f = parse_fields("StreamTitle='Robbie Williams - Advertising Space';");
+        assert_eq!(ad_marker(&f), (false, None));
+        let f = parse_fields("StreamTitle='x';adw_ad='false';");
+        assert_eq!(ad_marker(&f).0, false);
+    }
 }

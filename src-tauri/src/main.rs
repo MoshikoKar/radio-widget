@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
@@ -74,7 +74,9 @@ fn defaults() -> Map<String, Value> {
         "logoPos": null,
         "anchor": null,
         "pos": {},
-        "favorites": []
+        "favorites": [],
+        "adDuck": true,
+        "adLevel": 0.5
     })
     .as_object()
     .cloned()
@@ -380,10 +382,16 @@ fn set_auto_start(app: &AppHandle, on: bool) -> bool {
 
 fn update_tray(app: &AppHandle) {
     let Some(tray) = app.tray_by_id("main") else { return };
-    let (np, on_top, hotkey) = {
+    let (np, on_top, hotkey, ad_duck, ad_level) = {
         let st = app.state::<Shared>();
         let g = st.lock().unwrap();
-        (g.now_playing.clone(), stay_on_top(&g), g.hotkey)
+        (
+            g.now_playing.clone(),
+            stay_on_top(&g),
+            g.hotkey,
+            g.settings.get("adDuck").and_then(Value::as_bool).unwrap_or(true),
+            g.settings.get("adLevel").and_then(Value::as_f64).unwrap_or(0.5),
+        )
     };
     let tip: Vec<&str> = ["Radio Widget", np.station.as_str(), np.title.as_str()]
         .into_iter()
@@ -398,15 +406,53 @@ fn update_tray(app: &AppHandle) {
         let show = MenuItem::with_id(app, "showhide", if visible { "Hide widget" } else { "Show widget" }, true, hotkey)?;
         let top = CheckMenuItem::with_id(app, "stayontop", "Stay on top", true, on_top, None::<&str>)?;
         let auto = CheckMenuItem::with_id(app, "autostart", "Start with Windows", true, auto_start(app), None::<&str>)?;
+        let duck = CheckMenuItem::with_id(app, "adduck", "Lower volume during ads", true, ad_duck, None::<&str>)?;
+        let levels = AD_LEVELS
+            .iter()
+            .map(|&(id, label, v)| CheckMenuItem::with_id(app, id, label, ad_duck, (ad_level - v).abs() < 0.01, None::<&str>))
+            .collect::<tauri::Result<Vec<_>>>()?;
+        let level_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = levels.iter().map(|m| m as _).collect();
+        let level = Submenu::with_items(app, "Ad volume", ad_duck, &level_refs)?;
         let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
         Menu::with_items(
             app,
-            &[&play, &show, &PredefinedMenuItem::separator(app)?, &top, &auto, &PredefinedMenuItem::separator(app)?, &quit],
+            &[
+                &play,
+                &show,
+                &PredefinedMenuItem::separator(app)?,
+                &top,
+                &auto,
+                &PredefinedMenuItem::separator(app)?,
+                &duck,
+                &level,
+                &PredefinedMenuItem::separator(app)?,
+                &quit,
+            ],
         )
     };
     if let Ok(menu) = build() {
         let _ = tray.set_menu(Some(menu));
     }
+}
+
+/// Ad volume as a share of the user's own volume.
+const AD_LEVELS: [(&str, &str, f64); 3] = [
+    ("adlevel-30", "Much quieter (30%)", 0.3),
+    ("adlevel-50", "Quieter (50%)", 0.5),
+    ("adlevel-70", "A little quieter (70%)", 0.7),
+];
+
+fn set_setting(app: &AppHandle, key: &str, v: Value) {
+    {
+        let st = app.state::<Shared>();
+        let mut g = st.lock().unwrap();
+        g.settings.insert(key.into(), v.clone());
+        schedule_save(app, &mut g);
+    }
+    if let Some(w) = main_window(app) {
+        let _ = w.emit("settings-changed", json!({ key: v }));
+    }
+    update_tray(app);
 }
 
 fn on_menu(app: &AppHandle, id: &str) {
@@ -450,8 +496,16 @@ fn on_menu(app: &AppHandle, id: &str) {
                 let _ = w.emit("settings-changed", json!({ "logoOpenOn": v }));
             }
         }
+        "adduck" => {
+            let cur = app.state::<Shared>().lock().unwrap().settings.get("adDuck").and_then(Value::as_bool).unwrap_or(true);
+            set_setting(app, "adDuck", json!(!cur));
+        }
         "quit" => app.exit(0),
-        _ => {}
+        _ => {
+            if let Some(&(_, _, v)) = AD_LEVELS.iter().find(|(lid, _, _)| *lid == id) {
+                set_setting(app, "adLevel", json!(v));
+            }
+        }
     }
 }
 
