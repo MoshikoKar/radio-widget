@@ -231,6 +231,10 @@ fn remember_pos(win: &WebviewWindow, inner: &mut Inner) {
     pos[mode.as_str()] = json!({ "x": b.x, "y": b.y });
 }
 
+fn has_pos(inner: &Inner, mode: &str) -> bool {
+    xy(inner.settings.get("pos").and_then(|p| p.get(mode))).is_some()
+}
+
 /// Where a mode opens: its remembered spot, or (first visit) derived from the
 /// current window — keeping the bottom-right corner, or the top edge if the
 /// window sits nearer the top of the screen.
@@ -262,8 +266,12 @@ fn apply_mode(app: &AppHandle, win: &WebviewWindow, inner: &mut Inner, next: &st
         inner.settings.insert("logoPos".into(), json!({ "x": r.x, "y": r.y }));
         inner.temp_from_logo = false;
         r
+    } else if from == "logo" && has_pos(inner, next) {
+        // open where the user last left this mode, wherever the logo is
+        inner.temp_from_logo = false;
+        rect_for_mode(win, inner, next)
     } else if from == "logo" {
-        // open next to the logo, so the cursor stays over the widget
+        // no spot for this mode yet: open next to the logo, so the cursor stays over the widget
         let mut x = b.x;
         let mut y = b.y;
         if x + w > wa.x + wa.w {
