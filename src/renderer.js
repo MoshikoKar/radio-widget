@@ -133,7 +133,7 @@ function ensureGraph() {
 
 function applyVolume(ramp = 0.02) {
   let v = state.muted ? 0 : state.settings.volume;
-  if (adQuiet()) v *= adLevel();
+  if (adQuiet()) v *= adLevel(); // share of the current volume: 32% at 50% → 16%
   if (gainNode) gainNode.gain.setTargetAtTime(v * v, actx.currentTime, ramp); // perceptual curve
   direct.volume = v * v;
 }

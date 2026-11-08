@@ -435,11 +435,11 @@ fn update_tray(app: &AppHandle) {
     }
 }
 
-/// Ad volume as a share of the user's own volume.
+/// Ad volume as a share of the current volume (slider 32% at 50% → plays like 16%).
 const AD_LEVELS: [(&str, &str, f64); 3] = [
-    ("adlevel-30", "Much quieter (30%)", 0.3),
-    ("adlevel-50", "Quieter (50%)", 0.5),
-    ("adlevel-70", "A little quieter (70%)", 0.7),
+    ("adlevel-30", "30% of current volume", 0.3),
+    ("adlevel-50", "50% of current volume", 0.5),
+    ("adlevel-70", "70% of current volume", 0.7),
 ];
 
 fn set_setting(app: &AppHandle, key: &str, v: Value) {
