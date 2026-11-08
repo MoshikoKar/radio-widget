@@ -423,7 +423,7 @@ function noteForHistory() {
   if (histPending && histPending.line === line) return;
   if (histPending) clearTimeout(histPending.timer);
   histPending = null;
-  if (!line || !state.station) return;
+  if (!line || !state.station || !currentIsSong()) return;
   const entry = { artist: state.artist, song: state.song, station: state.station.name };
   const sid = state.streamId;
   histPending = {
@@ -442,6 +442,38 @@ function noteForHistory() {
 }
 
 // ---------- Spotify ----------
+// Some stations put a show name, promo, spot code, phone number or frequency
+// where the song goes ("Breakfasters with Daniel Burt", "- Tim Hanley Show",
+// "Arby's - RBRA0026000 ~", "Xplore - Coming Soon ~", "kz"). Those still show
+// as text, but get no Spotify link and stay out of recently played.
+// Only sure signs count: anything that might be a real song keeps its link.
+const PROMO = /www\.|https?:\/\//i;
+const PROMO_SONG = /^(coming soon|up next|stay tuned|call now|listen live)$/i; // in the song slot
+// a lone title that names a show: "Breakfasters with Daniel Burt", "The Morning Show"
+const SHOW = /\S\s+with\s+\p{Lu}|\b(show|breakfast|program(me)?)$|^(תוכנית|התוכנית)\s/iu;
+const SPOT_CODE = /\b[A-Z]{2,}\d{3,}[A-Z0-9]*\b/; // RBRA0026000
+const FREQ = /\b\d{2,3}(?:[.,]\d{1,2})?\s?(?:fm|am|mhz|khz)\b|\b(?:fm|am)\s?\d{2,3}(?:[.,]\d{1,2})?\b/i;
+const digitsIn = (s) => (s.match(/\d/g) || []).length;
+const PHONE = (s) => /(?:\+|\b)\d[\d\s().-]{5,}\d\b/.test(s) && digitsIn(s.match(/(?:\+|\b)\d[\d\s().-]{5,}\d\b/)[0]) >= 8; // not "867-5309"
+function isSong(artist, song, stationName) {
+  artist = (artist || '').trim();
+  song = (song || '').trim();
+  if (!song || /~\s*$/.test(song) || PROMO_SONG.test(song)) return false; // "~" marks promos/ads on some stations
+  if (/^[-–—]\s/.test(song)) return false; // "- Tim Hanley Show": empty artist slot
+  // a lone title: only a tag of 1–3 letters ("kz") or a show name is sure
+  if (!artist && (/^\p{L}{1,3}$/u.test(song) || SHOW.test(song))) return false;
+  const st = squash(stationName || '');
+  for (const p of [artist, song].filter(Boolean)) {
+    if (PROMO.test(p) || SPOT_CODE.test(p) || FREQ.test(p) || PHONE(p)) return false;
+    // the station's own name in full ("Big FM" on "CFMK 96.3 Big FM")
+    const full = squash(p);
+    // (a plain word like "Gold" on "Radio Gold" may be a song, so it keeps its link)
+    if (st && (full === st || (full.length >= 4 && st.includes(full) && /fm|radio|רדיו|\d/.test(full)))) return false;
+  }
+  return true;
+}
+const currentIsSong = () => isSong(state.artist, state.song, state.station && state.station.name);
+
 function openSpotify(artist, song) {
   const q = [artist, song].filter(Boolean).join(' ').trim();
   if (q) window.radio.openSpotify(q);
@@ -530,7 +562,7 @@ function renderNowPlaying() {
   const duckText = inCall ? CALL_TEXT : AD_TEXT;
   const duckTip = inCall ? `${CALL_TIP}${call.apps.length ? `\n(${call.apps.join(', ')})` : ''}` : AD_TIP;
   body.classList.toggle('ad-quiet', adShown);
-  $('#btnSpotify').hidden = !songLine() || adShown;
+  $('#btnSpotify').hidden = !songLine() || adShown || !currentIsSong();
   $('#stationName').textContent = st ? st.name : '—';
   $('#stationName').title = st ? st.name : '';
   syncFavUI();
@@ -1039,7 +1071,9 @@ function historyRow(h) {
     e.stopPropagation();
     openSpotify(h.artist, h.song);
   });
-  b.append(txt, spot);
+  // entries saved before the song check existed may be shows or promos
+  if (isSong(h.artist, h.song, h.station)) b.append(txt, spot);
+  else b.append(txt);
   b.addEventListener('click', async () => {
     await window.radio.copy(line);
     toast('✓ ' + line);
