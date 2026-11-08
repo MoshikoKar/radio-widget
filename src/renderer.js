@@ -258,12 +258,24 @@ function setPlayUI(kind) {
 // ---------- now playing ----------
 const NO_INFO_TEXT = /^he\b/i.test(navigator.language) ? 'התחנה לא משדרת שם שיר' : 'Station doesn’t share song info';
 
-// Filler that some CDNs put in StreamTitle instead of a real song
+// Filler that some CDNs / stations put in StreamTitle instead of a real song:
+// "Powered by…", a bare "Live", or a status word ("מנגן", "Now playing"),
+// alone or next to the station's own name ("Mizrahit.Fm - מנגן").
+const GENERIC_WORDS =
+  /^(מנגן|מנגנים|מתנגן|עכשיו מנגן|משדר|משדרים|משדרים עכשיו|בשידור|בשידור חי|שידור חי|חי|אונליין|רדיו|מוזיקה|שיר|אמן|ללא שם|now playing|playing|play|on air|live|live stream|live radio|online|radio|music|stream|song|artist|title|untitled|no title|unknown|unknown artist|unknown title|various|various artists|n\/a|null|undefined|none|[-–—.·|:_\s]*)$/i;
+const squash = (s) => s.toLowerCase().replace(/[\s.\-–—_|:'"״׳!()[\]]+/g, '');
+function isStationName(x) {
+  const st = squash((state.station && state.station.name) || '');
+  const y = squash(x).replace(/(fm|radio|רדיו)$/, '');
+  return !!st && y.length >= 2 && (st.includes(y) || y.includes(st));
+}
 function isFillerTitle(t) {
   if (!t) return true;
-  if (/powered by|streaming|^cdn\b|^unknown$|^n\/a$|^-+$|^live$/i.test(t) || isAdTitle(t)) return true;
-  const st = state.station && state.station.name.toLowerCase();
-  return !!st && t.toLowerCase() === st;
+  if (/powered by|streaming|^cdn\b/i.test(t) || GENERIC_WORDS.test(t.trim()) || isAdTitle(t)) return true;
+  const parts = t.split(/\s+[-–—|]\s+/).map((x) => x.trim());
+  // the song slot is a status word, or every part is a status word / the station name
+  if (parts.length > 1 && GENERIC_WORDS.test(parts[parts.length - 1])) return true;
+  return parts.every((p) => GENERIC_WORDS.test(p) || isStationName(p));
 }
 
 // ---------- ads: lower the volume while the station says an ad is on ----------
@@ -555,11 +567,73 @@ function setStation(st, autoplay = true) {
   if (autoplay) play();
 }
 
+// ---------- random station ----------
+// Every press is a fresh, unbiased crypto draw — no pre-shuffled order to walk
+// through: first a country (any of them, the current one included), then a
+// station in it. Stations picked recently are left out so the same few don't
+// keep coming back.
+const shuffleRecent = [];
+
+function randomIndex(n) {
+  const limit = Math.floor(0x100000000 / n) * n; // reject the tail → no modulo bias
+  const buf = new Uint32Array(1);
+  do crypto.getRandomValues(buf);
+  while (buf[0] >= limit);
+  return buf[0] % n;
+}
+
+async function playRandom() {
+  const btn = $('#btnShuffle');
+  if (btn.classList.contains('busy')) return;
+  const curId = state.station && state.station.stationuuid;
+
+  // draw a country; if its list can't load, draw again from the rest
+  let cc = null;
+  let pool = [];
+  const left = [...COUNTRIES];
+  btn.classList.add('busy');
+  while (left.length && !pool.length) {
+    cc = left.splice(randomIndex(left.length), 1)[0];
+    try {
+      pool = (await fetchStations(cc)).filter((s) => s.stationuuid !== curId);
+    } catch {
+      pool = [];
+    }
+  }
+  btn.classList.remove('busy');
+  if (!pool.length) return toast(HE ? 'אין תחנות להגרלה' : 'No stations to pick from');
+
+  // remember up to half the pool (max 40) so repeats stay rare but possible
+  const memory = Math.min(40, Math.floor(pool.length / 2));
+  const recent = new Set(shuffleRecent.slice(shuffleRecent.length - memory));
+  const fresh = pool.filter((s) => !recent.has(s.stationuuid));
+  const choices = fresh.length ? fresh : pool;
+  const pick = choices[randomIndex(choices.length)];
+
+  if (curId && shuffleRecent[shuffleRecent.length - 1] !== curId) shuffleRecent.push(curId);
+  shuffleRecent.push(pick.stationuuid);
+  if (shuffleRecent.length > 80) shuffleRecent.splice(0, shuffleRecent.length - 80);
+  if (state.dropdown) closeDropdown();
+  if (cc !== state.settings.country) {
+    // follow the station: flag and stations list now show its country
+    state.settings.country = cc;
+    window.radio.save({ country: cc });
+    syncCountryUI();
+  }
+  state.stations = await fetchStations(cc);
+  state.stationsCountry = cc;
+  setStation(pick, true);
+}
+
 // ---------- visualizer ----------
 const vizBig = $('#vizBig');
 const vizSmall = $('#vizSmall');
 let silentFrames = 0;
 let synthPhase = 0;
+const VIZ_TONES = (() => {
+  const cs = getComputedStyle(document.documentElement);
+  return ['--tone-1', '--tone-2', '--tone-3'].map((v) => cs.getPropertyValue(v).trim());
+})();
 
 function fitCanvas(c) {
   const dpr = window.devicePixelRatio || 1;
@@ -607,12 +681,12 @@ function drawViz(c, n) {
   const slot = W / n;
   const bw = Math.max(1.5, slot * 0.42);
   const mid = H / 2;
-  const t = performance.now() / 4000;
+  g.globalAlpha = state.playing ? 0.95 : 0.45;
   for (let i = 0; i < n; i++) {
     const h = Math.max(2, lv[i] * H * 0.96);
-    const hue = (i / n) * 300 + t * 60;
-    g.fillStyle = `hsl(${hue % 360} 80% ${state.playing ? 62 : 45}%)`;
-    g.globalAlpha = state.playing ? 0.95 : 0.5;
+    // three solid bands, mirrored: core (bass) in the middle, lighter toward the edges
+    const k = Math.abs(i - (n - 1) / 2) / ((n - 1) / 2);
+    g.fillStyle = VIZ_TONES[k < 0.36 ? 0 : k < 0.7 ? 1 : 2];
     const x = i * slot + (slot - bw) / 2;
     const r = bw / 2;
     g.beginPath();
@@ -822,21 +896,35 @@ async function loadStations(force = false) {
   if (favorites().length) renderList('stations'); // favorites show while the rest loads
   else listState('stations', 'loading');
   try {
-    const rows = await window.radio.api(
-      `stations/search?countrycode=${encodeURIComponent(cc)}&hidebroken=true&order=clickcount&reverse=true&limit=400`
-    );
-    const seen = new Set();
-    state.stations = rows.filter((s) => {
-      const key = (s.name || '').trim().toLowerCase();
-      if (!key || !s.url_resolved || s.hls === 1 || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const list = await fetchStations(cc, force);
+    if (state.settings.country !== cc) return; // switched country meanwhile
+    state.stations = list;
     state.stationsCountry = cc;
-    if (state.settings.country === cc) renderList('stations', true);
+    renderList('stations', true);
   } catch {
-    listState('stations', 'error', () => loadStations(true));
+    if (state.settings.country === cc) listState('stations', 'error', () => loadStations(true));
   }
+}
+
+// One list per country, kept for the session (random play draws from all of them).
+const stationCache = new Map(); // cc → Promise<station[]>
+function fetchStations(cc, force = false) {
+  if (force || !stationCache.has(cc)) {
+    const p = window.radio
+      .api(`stations/search?countrycode=${encodeURIComponent(cc)}&hidebroken=true&order=clickcount&reverse=true&limit=400`)
+      .then((rows) => {
+        const seen = new Set();
+        return rows.filter((s) => {
+          const key = (s.name || '').trim().toLowerCase();
+          if (!key || !s.url_resolved || s.hls === 1 || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      });
+    p.catch(() => stationCache.get(cc) === p && stationCache.delete(cc)); // a failed load is retried next time
+    stationCache.set(cc, p);
+  }
+  return stationCache.get(cc);
 }
 
 function stationRow(s) {
@@ -1001,6 +1089,7 @@ for (const n of [$('.titlebar'), $('#compact')]) {
 // ---------- expanded / compact controls ----------
 $('#btnPlayBig').addEventListener('click', togglePlay);
 $('#btnPlaySmall').addEventListener('click', togglePlay);
+$('#btnShuffle').addEventListener('click', playRandom);
 $('#btnClose').addEventListener('click', () => window.radio.hide()); // keeps playing; quit from the tray
 $('#btnCollapse').addEventListener('click', () => setMode(state.settings.stayOnTop ? 'logo' : 'compact'));
 $('#btnExpand').addEventListener('click', () => setMode('expanded'));

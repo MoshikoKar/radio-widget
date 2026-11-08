@@ -1,0 +1,180 @@
+# Builds, signs and publishes a release whenever a version tag (v1.2.3) is pushed.
+#
+# Signing goes through SignPath Foundation (free code signing for open source).
+# It turns on by itself once the repository variables below are set; until then
+# the release is published unsigned, exactly as before.
+#
+#   Settings → Secrets and variables → Actions
+#     secret    SIGNPATH_API_TOKEN          API token of the SignPath CI user
+#     variable  SIGNPATH_ORGANIZATION_ID    from the SignPath organization page
+#     variable  SIGNPATH_PROJECT_SLUG       e.g. radio-widget
+#     variable  SIGNPATH_POLICY_SLUG        release-signing (or test-signing while testing)
+#
+# The artifact configuration to use in SignPath is .github/signpath/artifact-configuration.xml.
+#
+# The app exe is signed first and put back before the installer is made, so the
+# exe inside the installer is signed too. Then the installer itself is signed.
+# Signing needs the SignPath project's approval of each request (release-signing).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build and publish, e.g. v0.5.4
+        required: true
+
+permissions:
+  contents: write # create the release
+  actions: read   # lets SignPath download the build artifacts
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check the tag matches the app version
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$v" -ne $env:TAG) { throw "Tag $env:TAG doesn't match tauri.conf.json version $v" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --release
+
+      - name: Build the app
+        run: npx tauri build --no-bundle
+
+      # `tauri bundle` patches the exe (bundle type = nsis) the first time it runs,
+      # which would break a signature. So bundle once now to patch it, sign the
+      # patched exe, and bundle again below: the second run leaves the exe as is.
+      - name: Patch the app for the installer
+        run: npx tauri bundle --bundles nsis
+
+      # ---------- sign the app exe ----------
+      - name: Upload the unsigned app
+        id: unsigned-app
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-app
+          path: src-tauri/target/release/radio-widget.exe
+          if-no-files-found: error
+
+      - name: Sign the app (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-app
+
+      - name: Use the signed app
+        if: env.SIGN == 'true'
+        run: Copy-Item signed-app/radio-widget.exe src-tauri/target/release/radio-widget.exe -Force
+
+      # ---------- installer ----------
+      - name: Build the installer
+        run: npx tauri bundle --bundles nsis
+
+      - name: Collect the release files
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "src-tauri/target/release/bundle/nsis/Radio Widget_${env:VERSION}_x64-setup.exe" "dist/RadioWidget_${env:VERSION}_x64-setup.exe"
+          Copy-Item src-tauri/target/release/radio-widget.exe "dist/RadioWidget_${env:VERSION}_x64-portable.exe"
+
+      # ---------- sign the installer ----------
+      - name: Upload the unsigned installer
+        id: unsigned-setup
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-setup
+          path: dist/RadioWidget_${{ env.VERSION }}_x64-setup.exe
+          if-no-files-found: error
+
+      - name: Sign the installer (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed-setup
+
+      - name: Use the signed installer and check both signatures
+        if: env.SIGN == 'true'
+        run: |
+          Copy-Item "signed-setup/RadioWidget_${env:VERSION}_x64-setup.exe" dist/ -Force
+          foreach ($f in Get-ChildItem dist/*.exe) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            "$($f.Name): $($s.Status) — $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid') { throw "$($f.Name) is not validly signed" }
+          }
+
+      # ---------- publish ----------
+      - name: Write the release notes
+        run: |
+          $v = $env:VERSION
+          $out = @()
+          $out += "**Download:** ``RadioWidget_${v}_x64-setup.exe`` installs for the current user and needs no admin rights. ``RadioWidget_${v}_x64-portable.exe`` is a single exe you can run without installing."
+          $out += ''
+          if ($env:SIGN -eq 'true') {
+            $out += '> 🔏 Signed automatically by the release build. Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).'
+          } else {
+            $out += "> The files aren't code-signed, so Windows SmartScreen may show a warning. Click **More info**, then **Run anyway**."
+          }
+          $out += ''
+          $notes = ".github/release-notes/$env:TAG.md"
+          if (Test-Path $notes) { $out += (Get-Content $notes -Raw -Encoding utf8).Trim(); $out += '' }
+          $out += 'Requires Windows 10/11 x64 with WebView2, which is built into Windows 11.'
+          $out -join "`n" | Set-Content release-notes.md -Encoding utf8NoBOM
+
+      - name: Publish the release
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG (Get-ChildItem dist/*.exe).FullName --clobber
+            gh release edit $env:TAG --notes-file release-notes.md
+          } else {
+            gh release create $env:TAG (Get-ChildItem dist/*.exe).FullName --title "Radio Widget $env:VERSION" --notes-file release-notes.md --latest
+          }

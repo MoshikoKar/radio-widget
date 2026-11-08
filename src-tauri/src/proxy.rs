@@ -176,9 +176,35 @@ fn decode(raw: &[u8]) -> String {
     let end = raw.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
     let raw = &raw[..end];
     match std::str::from_utf8(raw) {
-        Ok(s) => s.to_string(),
+        Ok(s) => undo_latin1_hebrew(s).unwrap_or_else(|| s.to_string()),
         Err(_) => encoding_rs::WINDOWS_1255.decode(raw).0.into_owned(),
     }
+}
+
+/// Some servers read windows-1255 titles as Latin-1 and re-send them as UTF-8,
+/// so Hebrew arrives as "æàú àéé". Then every char is ≤ U+00FF and Hebrew words
+/// are runs of U+00E0–U+00FA (the 1255 letter range) with no ASCII letters in
+/// them. Real Latin text ("Almiñana", "été") always mixes the two inside a word.
+fn undo_latin1_hebrew(s: &str) -> Option<String> {
+    if s.is_ascii() || s.chars().any(|c| c as u32 > 0xFF) {
+        return None;
+    }
+    let letter = |c: char| ('\u{E0}'..='\u{FA}').contains(&c);
+    let mut hebrew_words = 0;
+    for w in s.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()) {
+        let high = w.chars().filter(|&c| !c.is_ascii()).count();
+        if high > 0 && w.chars().any(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        if w.chars().count() >= 2 && w.chars().all(letter) {
+            hebrew_words += 1;
+        }
+    }
+    if hebrew_words == 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+    Some(encoding_rs::WINDOWS_1255.decode(&bytes).0.into_owned())
 }
 
 /// ICY metadata is `Key='value';Key2='value2';`. Values may contain quotes
@@ -256,6 +282,17 @@ mod tests {
     fn detects_adswizz_in_stream_url() {
         let f = parse_fields("StreamTitle='Brand';StreamUrl='http://x.example/a?adw_ad=true&durationMilliseconds=15000';");
         assert_eq!(ad_marker(&f), (true, Some(15000)));
+    }
+
+    #[test]
+    fn repairs_hebrew_sent_as_latin1() {
+        // "שלום עולם" in windows-1255, mis-read as Latin-1 and re-encoded as UTF-8
+        assert_eq!(decode("ùìåí òåìí".as_bytes()), "שלום עולם");
+        assert_eq!(decode("Eyal - ùìåí".as_bytes()), "Eyal - שלום");
+        // real UTF-8 text is left alone
+        for s in ["שלום עולם", "Juan Almiñana Obando", "Café de l'été", "Beyoncé - Halo", "à la carte"] {
+            assert_eq!(decode(s.as_bytes()), s);
+        }
     }
 
     #[test]

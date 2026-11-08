@@ -9,6 +9,10 @@
   --accent: #5b8cff;
   --accent-2: #8b5bff;
   --pin-on: #ff6b5b;
+  /* play button + equalizer: three solid tones (core → outer) */
+  --tone-1: #6b7bff;
+  --tone-2: #a08cff;
+  --tone-3: #d4d8ff;
   --radius: 16px;
   --h-expanded: 206px;
   --h-compact: 56px;
@@ -81,7 +85,8 @@ body[data-mode='logo'] #logoView { display: flex; }
   width: 38px;
   height: 38px;
   border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  background: var(--tone-1);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 4px 14px rgba(107, 123, 255, 0.32);
   color: #fff;
   font-size: 17px;
   display: inline-flex;
@@ -89,9 +94,9 @@ body[data-mode='logo'] #logoView { display: flex; }
   justify-content: center;
   position: relative;
   flex: none;
-  transition: transform 0.12s, filter 0.15s;
+  transition: transform 0.12s, filter 0.15s, box-shadow 0.15s;
 }
-.play-btn:hover { filter: brightness(1.12); }
+.play-btn:hover { filter: brightness(1.1); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 5px 18px rgba(107, 123, 255, 0.45); }
 .play-btn:active { transform: scale(0.94); }
 .play-btn.sm { width: 34px; height: 34px; font-size: 15px; }
 .play-btn > span { display: flex; }
@@ -101,10 +106,29 @@ body[data-mode='logo'] #logoView { display: flex; }
   inset: -3px;
   border-radius: 50%;
   border: 2px solid transparent;
-  border-top-color: var(--accent);
+  border-top-color: var(--tone-2);
   animation: spin 0.9s linear infinite;
 }
-.play-btn.error { background: #4a2a30; color: #ff8a8a; }
+.play-btn.error { background: #4a2a30; color: #ff8a8a; box-shadow: none; }
+
+/* random station, beside the play button */
+.controls { display: flex; align-items: center; gap: 8px; }
+.shuffle-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  transition: background 0.15s, color 0.15s, transform 0.12s;
+}
+.shuffle-btn:hover { background: rgba(255, 255, 255, 0.11); color: var(--tone-3); }
+.shuffle-btn:active { transform: scale(0.9); }
+.shuffle-btn.busy { opacity: 0.5; pointer-events: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .slider {

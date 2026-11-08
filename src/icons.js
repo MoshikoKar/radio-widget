@@ -4,8 +4,11 @@ const svg = (body, vb = '0 0 24 24') =>
 
 window.ICONS = {
   star: svg('<path d="m12 3.5 2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.2-4.1 5.8-.8z"/>'),
-  play: svg('<path d="M8 5.2v13.6a.6.6 0 0 0 .9.5l11-6.8a.6.6 0 0 0 0-1L8.9 4.7a.6.6 0 0 0-.9.5z" fill="currentColor" stroke="none"/>'),
-  pause: svg('<rect x="6" y="5" width="4" height="14" rx="1.2" fill="currentColor" stroke="none"/><rect x="14" y="5" width="4" height="14" rx="1.2" fill="currentColor" stroke="none"/>'),
+  // filled, with a matching stroke to round the corners; drawn edges span x 6–18.9,
+  // centered in the 24 box with a ~0.4 nudge right so the triangle reads as centered
+  play: svg('<path d="M6.8 6.3v11.4a1 1 0 0 0 1.5.86l9.3-5.7a1 1 0 0 0 0-1.72l-9.3-5.7A1 1 0 0 0 6.8 6.3z" fill="currentColor" stroke-width="1.6"/>'),
+  pause: svg('<rect x="6.5" y="5.5" width="3.6" height="13" rx="1.3" fill="currentColor" stroke="none"/><rect x="13.9" y="5.5" width="3.6" height="13" rx="1.3" fill="currentColor" stroke="none"/>'),
+  shuffle: svg('<path d="M16 4h4v4"/><path d="M4 19 20 4"/><path d="M20 16v4h-4"/><path d="m14.5 14.5 5.5 5.5"/><path d="M4 5l5 5"/>'),
   volume: svg('<path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke-width="1.5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/>'),
   mute: svg('<path d="M11 5 6 9H3v6h3l5 4z" fill="currentColor" stroke-width="1.5"/><path d="m16 9 5 6"/><path d="m21 9-5 6"/>'),
   pin: svg('<path d="M9 3h6l-1 6 4 4v2H6v-2l4-4z" fill="currentColor" fill-opacity=".25"/><path d="M12 15v6"/>'),
