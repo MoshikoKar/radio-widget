@@ -3,9 +3,9 @@
 A small internet radio widget for Windows. It plays thousands of stations from [radio-browser.info](https://www.radio-browser.info), shows the song and artist when the station sends them, and stays out of the way on your desktop. It runs in the tray and has no taskbar button.
 
 <p align="center">
-  <img src="docs/expanded.png" alt="Expanded mode" width="470"><br>
-  <img src="docs/compact.png" alt="Compact mode" width="372"><br>
-  <img src="docs/history.png" alt="Recently played list" width="470">
+  <img src="docs/widget-expanded.png" alt="Expanded mode, with the Spotify icon next to the song and the recently played button" width="470"><br>
+  <img src="docs/widget-compact.png" alt="Compact mode" width="372"><br>
+  <img src="docs/history-panel.png" alt="Recently played list" width="470">
 </p>
 
 Built with [Tauri 2](https://tauri.app). The backend is Rust and the UI runs in WebView2, which ships with Windows. The installer is about 1.4 MB.
