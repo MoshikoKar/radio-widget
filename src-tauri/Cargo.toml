@@ -2,6 +2,9 @@
 name = "radio-widget"
 version = "0.5.4"
 description = "Radio widget for Windows"
+authors = ["MoshikoKar"]
+license = "MIT"
+repository = "https://github.com/MoshikoKar/radio-widget"
 edition = "2021"
 
 [build-dependencies]

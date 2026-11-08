@@ -72,6 +72,8 @@ The [Release workflow](.github/workflows/release.yml) tests and builds the app, 
 
 Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
 
+Radio Widget is open source under the [MIT License](LICENSE). Everything signed is built from the source in this repository.
+
 - Committers and reviewers: [MoshikoKar](https://github.com/MoshikoKar)
 - Approvers: [MoshikoKar](https://github.com/MoshikoKar)
 
@@ -95,6 +97,10 @@ Some stations send no song title in the stream. The plan is to recognize the son
 - The proxy (`src-tauri/src/proxy.rs`) already has the stream bytes, so it can send a short audio sample (about 10 s) to a recognition service.
 - Recognition only runs for stations that send no song info.
 - After a song is recognized, it runs again only once that song should have ended.
+
+## License
+
+[MIT](LICENSE). Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Credits
 

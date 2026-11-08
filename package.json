@@ -3,6 +3,9 @@
   "version": "0.5.4",
   "private": true,
   "description": "Radio widget for Windows (Tauri)",
+  "license": "MIT",
+  "author": "MoshikoKar",
+  "repository": "github:MoshikoKar/radio-widget",
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build"
