@@ -37,6 +37,7 @@ Get the latest `RadioWidget_x.y.z_x64-setup.exe` from [**Releases**](https://git
 | **Ctrl+Alt+R** | Brings the widget to the front, or hides it if it already has focus. Falls back to Ctrl+Shift+Alt+R if Ctrl+Alt+R is taken |
 | **Positions** | Each mode remembers its own screen spot |
 | **Random station** | The shuffle button next to play picks a station at random from any of the countries, skipping ones it picked recently. The flag and station list follow it to its country |
+| **Dead stations** | A station that hasn't started playing within 15 s, or whose stream fails, is skipped for a random station, with a short message saying so. After 5 dead stations in a row it stops and shows the error. Nothing is skipped while Windows has no network |
 | **Favorites** | ★ on a station row or next to the station name. Favorites appear at the top of the station list, whatever country is selected |
 | **Countries** | 🇮🇱 🇺🇸 🇬🇧 🇨🇦 🇦🇺 🇮🇪 🇳🇿 🇿🇦. To change them, edit `COUNTRIES` in `src/renderer.js` and add the flag SVG to `src/flags/` and `flags.css` |
 | **Song info** | Read from ICY stream metadata through the local proxy (iHeart's extended `text="…"` titles included). Stations that send nothing, or only filler text, show "Station doesn't share song info" (in Hebrew when Windows is set to Hebrew) |

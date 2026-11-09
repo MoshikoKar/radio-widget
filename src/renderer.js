@@ -172,6 +172,8 @@ function play() {
   }, 10000);
   renderNowPlaying();
   setPlayUI('buffering');
+  clearTimeout(skipTimer);
+  skipTimer = setTimeout(() => skipDead(sid), SKIP_AFTER_MS);
   const url = state.station.url_resolved || state.station.url;
   if (state.proxyPort) {
     state.usingProxy = true;
@@ -203,6 +205,7 @@ function silence(a) {
 const RELEASE_AFTER_MS = 5 * 60 * 1000;
 let releaseTimer = null;
 function stop() {
+  clearTimeout(skipTimer);
   resetAd();
   state.streamId += 1; // ignore metadata still trickling in from the paused stream
   audio.pause();
@@ -219,13 +222,19 @@ function stop() {
 
 function togglePlay() {
   if (state.playing || $('#btnPlayBig').classList.contains('buffering')) stop();
-  else play();
+  else {
+    autoSkips = 0;
+    play();
+  }
 }
 
 const current = () => (state.usingProxy ? audio : direct);
 for (const a of [audio, direct]) {
   a.addEventListener('playing', () => {
     if (a !== current()) return;
+    clearTimeout(skipTimer);
+    autoSkips = 0;
+    playedSid = state.streamId;
     state.playing = true;
     setPlayUI('playing');
   });
@@ -240,7 +249,39 @@ for (const a of [audio, direct]) {
     }
     state.playing = false;
     setPlayUI('error');
+    // the stream is down: move on after a moment, so the error is seen
+    const sid = state.streamId;
+    clearTimeout(skipTimer);
+    skipTimer = setTimeout(() => skipDead(sid, true), SKIP_ON_ERROR_MS);
   });
+}
+
+// A station that hasn't started playing within 15 s (or whose stream fails)
+// is skipped for a random one. After a few dead stations in a row it stops
+// trying, and nothing is skipped while Windows reports no network.
+const SKIP_AFTER_MS = 15000;
+const SKIP_ON_ERROR_MS = 2500;
+const MAX_AUTO_SKIPS = 5;
+let skipTimer = null;
+let autoSkips = 0;
+let playedSid = -1; // the last stream that actually started playing
+// (state.playing can't tell: it stays true while switching from a playing station)
+function skipDead(sid, failed = false) {
+  if (sid !== state.streamId || !state.station) return;
+  if (!failed && playedSid === sid) return; // it started in time
+  if (!navigator.onLine) return;
+  const name = state.station.name;
+  if (autoSkips >= MAX_AUTO_SKIPS) {
+    autoSkips = 0;
+    silence(audio);
+    silence(direct);
+    state.playing = false;
+    setPlayUI('error');
+    return toast(HE ? 'כמה תחנות ברצף לא ניגנו — עצרתי' : 'Several stations in a row didn’t play — stopped');
+  }
+  autoSkips += 1;
+  toast(HE ? `${name} לא מנגנת — עובר לתחנה אחרת` : `${name} isn’t playing — trying another station`);
+  playRandom();
 }
 
 function setPlayUI(kind) {
@@ -447,12 +488,19 @@ function noteForHistory() {
 // "Arby's - RBRA0026000 ~", "Xplore - Coming Soon ~", "kz"). Those still show
 // as text, but get no Spotify link and stay out of recently played.
 // Only sure signs count: anything that might be a real song keeps its link.
-const PROMO = /www\.|https?:\/\//i;
-const PROMO_SONG = /^(coming soon|up next|stay tuned|call now|listen live)$/i; // in the song slot
+// a web address in either slot, or a "<name> is live" placeholder that some
+// streaming servers send when nothing is playing
+const PROMO = /www\.|https?:\/\/|\b[a-z0-9-]+\.(?:com|net|org|fm|io|radio|live|online|info|tv|co\.[a-z]{2})\b/i;
+const PROMO_SONG = /^(coming soon|up next|stay tuned|call now|listen live)$|\S\s+is\s+(?:now\s+)?(?:live|on air)!*$/i; // in the song slot
 // a lone title that names a show: "Breakfasters with Daniel Burt", "The Morning Show"
 const SHOW = /\S\s+with\s+\p{Lu}|\b(show|breakfast|program(me)?)$|^(תוכנית|התוכנית)\s/iu;
 const SPOT_CODE = /\b[A-Z]{2,}\d{3,}[A-Z0-9]*\b/; // RBRA0026000
 const FREQ = /\b\d{2,3}(?:[.,]\d{1,2})?\s?(?:fm|am|mhz|khz)\b|\b(?:fm|am)\s?\d{2,3}(?:[.,]\d{1,2})?\b/i;
+// Reads like a station's name, not a band's: "Radio"/"FM" as the first or last
+// word, or an FM frequency (87–108) as the first or last word. Band names have
+// these inside them or attached to other words, or use other numbers, so they
+// don't match.
+const STATIONISH = /^(?:radio|רדיו|fm)\s|\s(?:radio|רדיו|fm)$|[\p{L}\d]fm$|^(?:8[7-9]|9\d|10[0-8])(?:[.,]\d{1,2})?\s|\s(?:8[7-9]|9\d|10[0-8])(?:[.,]\d{1,2})?$/iu;
 const digitsIn = (s) => (s.match(/\d/g) || []).length;
 const PHONE = (s) => /(?:\+|\b)\d[\d\s().-]{5,}\d\b/.test(s) && digitsIn(s.match(/(?:\+|\b)\d[\d\s().-]{5,}\d\b/)[0]) >= 8; // not "867-5309"
 function isSong(artist, song, stationName) {
@@ -463,12 +511,17 @@ function isSong(artist, song, stationName) {
   // a lone title: only a tag of 1–3 letters ("kz") or a show name is sure
   if (!artist && (/^\p{L}{1,3}$/u.test(song) || SHOW.test(song))) return false;
   const st = squash(stationName || '');
-  for (const p of [artist, song].filter(Boolean)) {
+  for (const [p, isSongSlot] of [[artist, false], [song, true]]) {
+    if (!p) continue;
     if (PROMO.test(p) || SPOT_CODE.test(p) || FREQ.test(p) || PHONE(p)) return false;
-    // the station's own name in full ("Big FM" on "CFMK 96.3 Big FM")
+    // the station's own name in full, or a station-like part of it
     const full = squash(p);
-    // (a plain word like "Gold" on "Radio Gold" may be a song, so it keeps its link)
-    if (st && (full === st || (full.length >= 4 && st.includes(full) && /fm|radio|רדיו|\d/.test(full)))) return false;
+    const named = st && (full === st || (full.length >= 4 && st.includes(full)));
+    // Only a name that reads like a station counts: a station that plays one
+    // artist is often named after them and sends that name as the artist of
+    // every real song. In the song slot an exact match is enough too.
+    const stationish = STATIONISH.test(p);
+    if (named && (stationish || (isSongSlot && full === st))) return false;
   }
   return true;
 }
@@ -1123,7 +1176,10 @@ for (const n of [$('.titlebar'), $('#compact')]) {
 // ---------- expanded / compact controls ----------
 $('#btnPlayBig').addEventListener('click', togglePlay);
 $('#btnPlaySmall').addEventListener('click', togglePlay);
-$('#btnShuffle').addEventListener('click', playRandom);
+$('#btnShuffle').addEventListener('click', () => {
+  autoSkips = 0;
+  playRandom();
+});
 $('#btnClose').addEventListener('click', () => window.radio.hide()); // keeps playing; quit from the tray
 $('#btnCollapse').addEventListener('click', () => setMode(state.settings.stayOnTop ? 'logo' : 'compact'));
 $('#btnExpand').addEventListener('click', () => setMode('expanded'));
