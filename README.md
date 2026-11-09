@@ -17,7 +17,8 @@ Built with [Tauri 2](https://tauri.app). The backend is Rust and the UI runs in 
 Get the latest `RadioWidget_x.y.z_x64-setup.exe` from [**Releases**](https://github.com/MoshikoKar/radio-widget/releases/latest).
 
 - It installs for the current user only, so you don't need admin rights.
-- Every release is built and published by GitHub Actions. Code signing through [SignPath Foundation](https://signpath.org) is being set up (see [Code signing policy](#code-signing-policy)). Until a release says it's signed, Windows SmartScreen may warn you the first time. Click **More info**, then **Run anyway**.
+- Every release is built and published by GitHub Actions. The files aren't code-signed, so Windows SmartScreen may warn you the first time. Click **More info**, then **Run anyway**.
+- Once installed, the app updates itself from the tray menu (see **Updates** below). Versions before 0.5.8 don't have this: install 0.5.8 over them once by hand.
 - After installing, look for the widget's icon in the tray next to the clock.
 - It needs WebView2. Windows 11 and an up-to-date Windows 10 already have it. If it's missing, the installer downloads it.
 
@@ -28,7 +29,7 @@ Get the latest `RadioWidget_x.y.z_x64-setup.exe` from [**Releases**](https://git
 | **Expanded** | Shown at launch. Visualizer, logo, station name with a favorite ★, song and artist (click either to copy "Artist - Song"), play/pause, a shuffle button for a random station, volume, stay-on-top, start with Windows, station dropdown with search, and a country dropdown of flags |
 | **Compact** | Turns on after 20 s idle when stay-on-top is off. Has expand, volume, a visualizer (hover shows artist and song, click copies them), the logo (click it to pick a station) and play/pause. It stays compact until you click expand |
 | **Logo** (stay-on-top) | Turns on after 6 s idle when stay-on-top is on. A semi-transparent logo that stays on top. Drag it to move it. Hover or click opens Expanded (right-click to choose which), at the spot where you last left it. Expanded goes back to the logo after 6 s idle |
-| **Widget, not app** | No taskbar button. A tray icon has Play/Pause, Show/Hide, Stay on top, Start with Windows, the ad and call volume settings, and Quit. Its tooltip shows the station and song. × hides the widget and the music keeps playing |
+| **Widget, not app** | No taskbar button. A tray icon has Play/Pause, Show/Hide, Stay on top, Start with Windows, the ad and call volume settings, updates, and Quit. Its tooltip shows the station and song. × hides the widget and the music keeps playing |
 | **Windows media controls** | The volume flyout and lock screen show the song, artist and station, with cover art when the station sends it. The keyboard's media keys play/pause, and next/previous step through your favorites (or the country's stations if you have none) |
 | **Spotify** | The Spotify icon next to the song searches for it in the Spotify app, or on open.spotify.com if the app isn't installed. It's hidden when there's no song title, or when the station sends a show name, promo, ad code, phone number or its own name/frequency instead |
 | **Recently played** | The clock button lists the last 10 songs with time, artist and station. A song is added once it has played for 20 s, so jingles and quick switches stay out. Click a row to copy it, or its Spotify icon to open it |
@@ -38,6 +39,7 @@ Get the latest `RadioWidget_x.y.z_x64-setup.exe` from [**Releases**](https://git
 | **Positions** | Each mode remembers its own screen spot |
 | **Random station** | The shuffle button next to play picks a station at random from any of the countries, skipping ones it picked recently. The flag and station list follow it to its country |
 | **Dead stations** | A station that hasn't started playing within 15 s, or whose stream fails, is skipped for a random station, with a short message saying so. After 5 dead stations in a row it stops and shows the error. Nothing is skipped while Windows has no network |
+| **Updates** | About 15 s after launch, and once a day while it runs, the app checks GitHub for a new release. When there is one, the widget shows a short message and the tray menu offers "Update to version x.y.z", which downloads the installer, updates in place and starts the widget again. Your settings stay. The update is only installed if its signature matches the key built into the app. "Check for updates" in the tray checks right away. The portable exe can't update itself: its menu item opens the release page |
 | **Favorites** | ★ on a station row or next to the station name. Favorites appear at the top of the station list, whatever country is selected |
 | **Countries** | 🇮🇱 🇺🇸 🇬🇧 🇨🇦 🇦🇺 🇮🇪 🇳🇿 🇿🇦. To change them, edit `COUNTRIES` in `src/renderer.js` and add the flag SVG to `src/flags/` and `flags.css` |
 | **Song info** | Read from ICY stream metadata through the local proxy (iHeart's extended `text="…"` titles included). Stations that send nothing, or only filler text, show "Station doesn't share song info" (in Hebrew when Windows is set to Hebrew) |
@@ -67,22 +69,11 @@ npm run build    # writes the NSIS installer to src-tauri/target/release/bundle/
 2. Write the release's changes in `.github/release-notes/vX.Y.Z.md` (optional). If you retake the screenshots, save them under new names (GitHub caches README images by URL).
 3. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 
-The [Release workflow](.github/workflows/release.yml) tests and builds the app, has SignPath sign the exe and then the installer, and publishes both to Releases. Signing turns on once the `SIGNPATH_*` secret and variables listed at the top of the workflow are set. Until then releases are published unsigned.
+The [Release workflow](.github/workflows/release.yml) tests and builds the app and publishes the installer, the portable exe and `latest.json` to Releases. `latest.json` is what installed apps check for updates. It carries the installer's signature, made with the update key in the `TAURI_SIGNING_PRIVATE_KEY` repository secret. The matching public key is in `tauri.conf.json`. If the secret is missing, the release build fails rather than publish an update nobody can install. Keep a copy of the private key: without it, installed apps can't be updated any more.
 
-## Code signing policy
+## Privacy
 
-Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
-
-Radio Widget is open source under the [MIT License](LICENSE). Everything signed is built from the source in this repository.
-
-- Committers and reviewers: [MoshikoKar](https://github.com/MoshikoKar)
-- Approvers: [MoshikoKar](https://github.com/MoshikoKar)
-
-Only files built by this repository's [Release workflow](.github/workflows/release.yml) from a version tag are signed. Each signing request is approved by hand in SignPath.
-
-### Privacy
-
-The app connects to [radio-browser.info](https://www.radio-browser.info) to list stations, and to the stream of the station you play. Clicking the Spotify icon opens Spotify with a search for the song. It sends nothing else anywhere: no accounts, analytics or telemetry. Settings stay on your PC in `%APPDATA%\com.moshiko.radiowidget`.
+The app connects to [radio-browser.info](https://www.radio-browser.info) to list stations, and to the stream of the station you play. Clicking the Spotify icon opens Spotify with a search for the song. It checks GitHub for a new release about once a day (a plain download of `latest.json`, nothing about you is sent). It sends nothing else anywhere: no accounts, analytics or telemetry. Settings stay on your PC in `%APPDATA%\com.moshiko.radiowidget`.
 
 ## Layout
 

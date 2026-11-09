@@ -7,6 +7,7 @@
 mod calls;
 mod http;
 mod proxy;
+mod updater;
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -118,6 +119,12 @@ fn write_settings(app: &AppHandle, s: &Map<String, Value>) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, serde_json::to_string_pretty(s).unwrap_or_default());
+}
+
+/// Writes the settings right away (before the app is closed for an update).
+fn save_settings_now(app: &AppHandle) {
+    let snapshot = app.state::<Shared>().lock().unwrap().settings.clone();
+    write_settings(app, &snapshot);
 }
 
 /// Debounced save (drags fire many move events).
@@ -426,6 +433,8 @@ fn update_tray(app: &AppHandle) {
         let level = level_menu(app, "adlevel", "Ad volume", ad_duck, ad_level)?;
         let cduck = CheckMenuItem::with_id(app, "callduck", "Lower volume during calls", true, call_duck, None::<&str>)?;
         let clevel = level_menu(app, "calllevel", "Call volume", call_duck, call_level)?;
+        let (update_text, update_on) = updater::label(app);
+        let update = MenuItem::with_id(app, "update", update_text, update_on, None::<&str>)?;
         let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
         Menu::with_items(
             app,
@@ -441,6 +450,7 @@ fn update_tray(app: &AppHandle) {
                 &cduck,
                 &clevel,
                 &PredefinedMenuItem::separator(app)?,
+                &update,
                 &quit,
             ],
         )
@@ -526,6 +536,7 @@ fn on_menu(app: &AppHandle, id: &str) {
             set_setting(app, key, json!(!cur));
         }
         "quit" => app.exit(0),
+        "update" => updater::on_click(app),
         _ => {
             let level = |prefix: &str| id.strip_prefix(prefix).and_then(|p| p.parse::<u32>().ok()).filter(|p| DUCK_LEVELS.contains(p));
             if let Some(p) = level("adlevel-") {
@@ -707,14 +718,32 @@ fn hide(app: AppHandle) {
 /// installed (it registers the spotify: protocol), otherwise on the web.
 #[tauri::command]
 fn open_spotify(query: String) {
+    open_target(&spotify_target(&query).unwrap_or_default());
+}
+
+fn open_url(url: &str) {
+    open_target(url);
+}
+
+fn open_target(target: &str) {
     use windows::core::{w, HSTRING};
-    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if target.is_empty() {
+        return;
+    }
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(target), None, None, SW_SHOWNORMAL);
+    }
+}
+
+fn spotify_target(query: &str) -> Option<String> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ};
 
     let q = query.trim();
     if q.is_empty() {
-        return;
+        return None;
     }
     let enc = url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>().replace('+', "%20");
     let has_app = unsafe {
@@ -725,10 +754,7 @@ fn open_spotify(query: String) {
         }
         ok
     };
-    let target = if has_app { format!("spotify:search:{enc}") } else { format!("https://open.spotify.com/search/{enc}") };
-    unsafe {
-        ShellExecuteW(None, w!("open"), &HSTRING::from(target), None, None, SW_SHOWNORMAL);
-    }
+    Some(if has_app { format!("spotify:search:{enc}") } else { format!("https://open.spotify.com/search/{enc}") })
 }
 
 #[tauri::command]
@@ -761,6 +787,7 @@ const HOTKEYS: [(&str, Modifiers); 2] = [
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_widget(app)))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -853,6 +880,7 @@ fn main() {
                     }
                 })
                 .build(app)?;
+            updater::start(handle.clone());
             update_tray(&handle);
             Ok(())
         })

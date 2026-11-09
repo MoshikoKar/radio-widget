@@ -151,6 +151,34 @@ jobs:
             if ($s.Status -ne 'Valid') { throw "$($f.Name) is not validly signed" }
           }
 
+      # ---------- in-app updater ----------
+      # The app checks releases/latest/download/latest.json and only installs a
+      # setup.exe whose signature matches the public key in tauri.conf.json.
+      # Signed here, after SignPath, because that changes the file.
+      - name: Sign the update and write latest.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          CI: true
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Secret TAURI_SIGNING_PRIVATE_KEY is missing, so installed apps would not get this update' }
+          $file = "RadioWidget_${env:VERSION}_x64-setup.exe"
+          npx tauri signer sign "dist/$file"
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the update failed' }
+          $notes = ".github/release-notes/$env:TAG.md"
+          [ordered]@{
+            version   = $env:VERSION
+            notes     = if (Test-Path $notes) { (Get-Content $notes -Raw -Encoding utf8).Trim() } else { '' }
+            pub_date  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            platforms = [ordered]@{
+              'windows-x86_64' = [ordered]@{
+                signature = (Get-Content "dist/$file.sig" -Raw).Trim()
+                url       = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$file"
+              }
+            }
+          } | ConvertTo-Json -Depth 5 | Set-Content dist/latest.json -Encoding utf8NoBOM
+          Remove-Item "dist/$file.sig"
+          Get-Content dist/latest.json
+
       # ---------- publish ----------
       - name: Write the release notes
         run: |
@@ -173,8 +201,8 @@ jobs:
         run: |
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG (Get-ChildItem dist/*.exe).FullName --clobber
+            gh release upload $env:TAG (Get-ChildItem dist/*.exe, dist/latest.json).FullName --clobber
             gh release edit $env:TAG --notes-file release-notes.md
           } else {
-            gh release create $env:TAG (Get-ChildItem dist/*.exe).FullName --title "Radio Widget $env:VERSION" --notes-file release-notes.md --latest
+            gh release create $env:TAG (Get-ChildItem dist/*.exe, dist/latest.json).FullName --title "Radio Widget $env:VERSION" --notes-file release-notes.md --latest
           }

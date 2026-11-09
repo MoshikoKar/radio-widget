@@ -47,5 +47,7 @@
     onMetadata: (cb) => listen('metadata', (e) => cb(e.payload)),
     onSettings: (cb) => listen('settings-changed', (e) => cb(e.payload)),
     onWake: (cb) => listen('wake', () => cb()),
+    onUpdate: (cb) => listen('update-available', (e) => cb(e.payload)),
+    onUpdateFailed: (cb) => listen('update-failed', () => cb()),
   };
 })();
