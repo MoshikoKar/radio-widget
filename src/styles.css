@@ -204,7 +204,7 @@ body[data-mode='logo'] #logoView { display: flex; }
   background: var(--faint);
   margin-left: 2px;
 }
-body.playing .live { background: #ff4d5e; box-shadow: 0 0 0 3px rgba(255, 77, 94, 0.18); animation: pulse 1.6s ease-in-out infinite; }
+body.playing .live { background: #ff4d5e; box-shadow: 0 0 0 3px rgba(255, 77, 94, 0.18); animation: pulse 1.6s steps(16) infinite; } /* stepped: ~10 repaints/s, not 60 */
 @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(255, 77, 94, 0.05); } }
 
 .main {

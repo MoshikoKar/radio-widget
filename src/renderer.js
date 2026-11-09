@@ -122,7 +122,8 @@ function ensureGraph() {
   const src = actx.createMediaElementSource(audio);
   analyser = actx.createAnalyser();
   analyser.fftSize = 256;
-  analyser.smoothingTimeConstant = 0.78;
+  // the visualizer samples 30×/s; 0.62 decays like 0.78 did at 60×/s
+  analyser.smoothingTimeConstant = 0.62;
   gainNode = actx.createGain();
   src.connect(analyser);
   analyser.connect(gainNode);
@@ -738,7 +739,9 @@ function fitCanvas(c) {
   }
 }
 
-function levels(n) {
+// `step` = frames' worth of time since the last draw (1 = 1/60 s), so the
+// synthetic wave moves at the same speed whatever the frame rate.
+function levels(n, step) {
   const out = new Array(n).fill(0);
   if (state.playing && analyser) {
     analyser.getByteFrequencyData(freq);
@@ -753,10 +756,10 @@ function levels(n) {
       sum += v;
     }
     silentFrames = sum === 0 ? silentFrames + 1 : 0;
-    if (silentFrames < 45) return out;
+    if (silentFrames < 23) return out; // ~0.75 s of silence
   }
   // idle wave when paused, synthetic motion if analyser gives nothing while playing
-  synthPhase += state.playing ? 0.09 : 0.025;
+  synthPhase += (state.playing ? 0.09 : 0.025) * step;
   for (let i = 0; i < n; i++) {
     const k = Math.abs(i - (n - 1) / 2) / ((n - 1) / 2);
     const wave = (Math.sin(i * 0.55 + synthPhase) + Math.sin(i * 0.23 - synthPhase * 1.7)) * 0.25 + 0.5;
@@ -765,12 +768,12 @@ function levels(n) {
   return out;
 }
 
-function drawViz(c, n) {
+function drawViz(c, n, step) {
   fitCanvas(c);
   const g = c.getContext('2d');
   const { width: W, height: H } = c;
   g.clearRect(0, 0, W, H);
-  const lv = levels(n);
+  const lv = levels(n, step);
   const slot = W / n;
   const bw = Math.max(1.5, slot * 0.42);
   const mid = H / 2;
@@ -789,10 +792,22 @@ function drawViz(c, n) {
   g.globalAlpha = 1;
 }
 
-function frame() {
-  if (state.mode === 'expanded') drawViz(vizBig, 38);
-  else if (state.mode === 'compact') drawViz(vizSmall, 24);
-  requestAnimationFrame(frame);
+// Every repaint of this transparent window costs GPU time, so the visualizer
+// doesn't run at the screen's rate: 30 fps while playing, 12 fps for the idle
+// wave, nothing in logo mode or while the window is hidden. Waiting on a timer
+// between frames (not a back-to-back rAF loop) lets the compositor sleep.
+const FRAME_GAP = { playing: 1000 / 30, idle: 1000 / 12 };
+let lastDraw = 0;
+function frame(now) {
+  const step = lastDraw ? Math.min(6, (now - lastDraw) / (1000 / 60)) : 1;
+  lastDraw = now;
+  if (!document.hidden) {
+    if (state.mode === 'expanded') drawViz(vizBig, 38, step);
+    else if (state.mode === 'compact') drawViz(vizSmall, 24, step);
+  }
+  // minus a few ms: the rAF then lands on the next vsync instead of one later
+  const gap = state.playing ? FRAME_GAP.playing : FRAME_GAP.idle;
+  setTimeout(() => requestAnimationFrame(frame), gap - 6);
 }
 
 // ---------- modes ----------

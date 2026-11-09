@@ -342,8 +342,42 @@ fn main_window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 // ---------- widget visibility / tray ----------
+/// Tells WebView2 the widget went to the tray (or came back). Hiding the window
+/// alone doesn't: the page would keep painting the visualizer and the GPU process
+/// would keep its buffers. Marked hidden, the page stops painting (audio keeps
+/// playing), and the Low memory level makes WebView2 trim what it can.
+fn set_webview_hidden(win: &WebviewWindow, hidden: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+    };
+    use windows::core::Interface;
+    let level = if hidden {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+    } else {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+    };
+    let _ = win.with_webview(move |wv| unsafe {
+        let controller = wv.controller();
+        let _ = controller.SetIsVisible(!hidden);
+        // ICoreWebView2_19 needs WebView2 Runtime 114+; older ones just skip this
+        if let Ok(core) = controller.CoreWebView2() {
+            if let Ok(core) = core.cast::<ICoreWebView2_19>() {
+                let _ = core.SetMemoryUsageTargetLevel(level);
+            }
+        }
+    });
+}
+
+fn hide_widget(app: &AppHandle, win: &WebviewWindow) {
+    let _ = win.hide();
+    set_webview_hidden(win, true);
+    update_tray(app);
+}
+
 fn show_widget(app: &AppHandle) {
     if let Some(win) = main_window(app) {
+        set_webview_hidden(&win, false);
         let _ = win.show();
         let _ = win.emit("wake", ());
     }
@@ -355,8 +389,7 @@ fn show_widget(app: &AppHandle) {
 fn bring_to_front(app: &AppHandle) {
     let Some(win) = main_window(app) else { return };
     if win.is_visible().unwrap_or(false) && win.is_focused().unwrap_or(false) {
-        let _ = win.hide();
-        update_tray(app);
+        hide_widget(app, &win);
         return;
     }
     show_widget(app);
@@ -499,10 +532,10 @@ fn on_menu(app: &AppHandle, id: &str) {
         }
         "showhide" => {
             if win.as_ref().and_then(|w| w.is_visible().ok()).unwrap_or(false) {
-                if let Some(w) = win {
-                    let _ = w.hide();
+                match win {
+                    Some(w) => hide_widget(app, &w),
+                    None => update_tray(app),
                 }
-                update_tray(app);
             } else {
                 bring_to_front(app);
             }
@@ -708,10 +741,10 @@ fn quit(app: AppHandle) {
 
 #[tauri::command]
 fn hide(app: AppHandle) {
-    if let Some(w) = main_window(&app) {
-        let _ = w.hide();
+    match main_window(&app) {
+        Some(w) => hide_widget(&app, &w),
+        None => update_tray(&app),
     }
-    update_tray(&app);
 }
 
 /// Opens a Spotify search for the song: in the Spotify app when it's
@@ -820,8 +853,10 @@ fn main() {
                 WindowEvent::CloseRequested { api, .. } => {
                     // × / Alt+F4 hide the widget; quit from the tray
                     api.prevent_close();
-                    let _ = window.hide();
-                    update_tray(app);
+                    match main_window(app) {
+                        Some(w) => hide_widget(app, &w),
+                        None => update_tray(app),
+                    }
                 }
                 WindowEvent::Moved(p) => {
                     if let Some(win) = main_window(app) {

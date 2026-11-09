@@ -10,7 +10,7 @@ A small internet radio widget for Windows. It plays thousands of stations from [
   <img src="docs/history-v0.5.4.png" alt="Recently played list" width="470">
 </p>
 
-Built with [Tauri 2](https://tauri.app). The backend is Rust and the UI runs in WebView2, which ships with Windows. The installer is about 1.4 MB.
+Built with [Tauri 2](https://tauri.app). The backend is Rust and the UI runs in WebView2, which ships with Windows. The installer is about 1.4 MB. In Task Manager the widget (with its WebView2 processes) uses about 30 MB while it sits in the tray, and more while it's on screen.
 
 ## Download
 
