@@ -42,7 +42,7 @@ Get the latest `RadioWidget_x.y.z_x64-setup.exe` from [**Releases**](https://git
 | **Updates** | About 15 s after launch, and once a day while it runs, the app checks GitHub for a new release. When there is one, the widget shows a short message and the tray menu offers "Update to version x.y.z", which downloads the installer, updates in place and starts the widget again. Your settings stay. The update is only installed if its signature matches the key built into the app. "Check for updates" in the tray checks right away. The portable exe can't update itself: its menu item opens the release page |
 | **Favorites** | ★ on a station row or next to the station name. Favorites appear at the top of the station list, whatever country is selected |
 | **Countries** | 🇮🇱 🇺🇸 🇬🇧 🇨🇦 🇦🇺 🇮🇪 🇳🇿 🇿🇦. To change them, edit `COUNTRIES` in `src/renderer.js` and add the flag SVG to `src/flags/` and `flags.css` |
-| **Song info** | Read from ICY stream metadata through the local proxy (iHeart's extended `text="…"` titles included). Stations that send nothing, or only filler text, show "Station doesn't share song info" (in Hebrew when Windows is set to Hebrew) |
+| **Song info** | Read from ICY stream metadata through the local proxy (iHeart's extended `text="…"` titles included). Stations that send nothing, only filler text, or titles their server already turned into "???", show "Station doesn't share song info" (in Hebrew when Windows is set to Hebrew) |
 
 The pointer resting on the widget counts as use, so the widget won't collapse under the cursor.
 Timings are at the top of `src/renderer.js` (`IDLE_TO_COMPACT_MS`, `IDLE_TO_LOGO_MS`, `LOGO_HOVER_DELAY_MS`).

@@ -310,8 +310,16 @@ function isStationName(x) {
   const y = squash(x).replace(/(fm|radio|רדיו)$/, '');
   return !!st && y.length >= 2 && (st.includes(y) || y.includes(st));
 }
+// The station's server turned letters it couldn't encode into "?" before
+// sending ("??????? - ??? ??????"): the text is gone, so there's nothing to show.
+function isLostText(t) {
+  const lost = (t.match(/[?�]/g) || []).length;
+  const letters = (t.match(/\p{L}/gu) || []).length;
+  return lost >= 3 && lost > letters;
+}
 function isFillerTitle(t) {
   if (!t) return true;
+  if (isLostText(t)) return true;
   if (/powered by|streaming|^cdn\b/i.test(t) || GENERIC_WORDS.test(t.trim()) || isAdTitle(t)) return true;
   const parts = t.split(/\s+[-–—|]\s+/).map((x) => x.trim());
   // the song slot is a status word, or every part is a status word / the station name
