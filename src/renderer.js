@@ -36,7 +36,7 @@ const state = {
   streamId: 0,
   noInfo: false,
   usingProxy: false,
-  dropdown: null, // 'stations' | 'country' | null
+  dropdown: null, // 'stations' | 'country' | 'history' | null
 };
 
 const regionNames = (() => {
@@ -684,7 +684,7 @@ async function playRandom() {
   // draw a country; if its list can't load, draw again from the rest
   let cc = null;
   let pool = [];
-  const left = [...COUNTRIES];
+  const left = [...myCountries()];
   btn.classList.add('busy');
   while (left.length && !pool.length) {
     cc = left.splice(randomIndex(left.length), 1)[0];
@@ -988,12 +988,15 @@ function listState(kind, what, retry) {
   dd[kind].list.replaceChildren(box);
 }
 
-// short fixed list: Israel plus English-speaking countries
-const COUNTRIES = ['IL', 'US', 'GB', 'CA', 'AU', 'IE', 'NZ', 'ZA'];
+// The user's countries (settings window → Countries). Out of the box: Israel
+// plus English-speaking countries.
+const DEFAULT_COUNTRIES = ['IL', 'US', 'GB', 'CA', 'AU', 'IE', 'NZ', 'ZA'];
+function myCountries() {
+  const list = state.settings && state.settings.countries;
+  return Array.isArray(list) && list.length ? list : DEFAULT_COUNTRIES;
+}
 function loadCountries() {
-  if (!state.countries) {
-    state.countries = COUNTRIES.map((code) => ({ code, apiName: code, name: countryName(code) }));
-  }
+  state.countries = myCountries().map((code) => ({ code, apiName: code, name: countryName(code) }));
   renderList('country');
 }
 
@@ -1189,6 +1192,15 @@ function listKeys(kind, e) {
   }
 }
 
+// ---------- settings (own window, see settings.js) ----------
+$('#btnSettings').title = HE ? 'הגדרות' : 'Settings';
+$('#btnSettings').addEventListener('click', () => window.radio.openSettings());
+// a dot on the gear while an update is waiting
+function onUpdateInfo(u) {
+  if (u) $('#btnSettings').classList.toggle('dot', u.state === 'available' || u.state === 'downloading');
+}
+window.radio.onUpdateState(onUpdateInfo);
+
 // ---------- window dragging (titlebar / empty parts of compact) ----------
 for (const n of [$('.titlebar'), $('#compact')]) {
   n.addEventListener('mousedown', (e) => {
@@ -1260,6 +1272,12 @@ window.radio.onSettings((patch) => {
   Object.assign(state.settings, rest);
   syncToggles(autoStart);
   if (['adDuck', 'adLevel', 'callDuck', 'callLevel'].some((k) => k in rest)) duckChanged();
+  // from the settings window
+  if ('countries' in rest && state.dropdown === 'country') loadCountries();
+  if ('country' in rest) {
+    syncCountryUI();
+    loadStations();
+  }
   bumpIdle();
 });
 window.radio.onTogglePlay(togglePlay);
@@ -1321,6 +1339,7 @@ if (ms) {
 }
 window.radio.onWake(() => setMode('expanded'));
 // a new version is announced by the backend (dialog + dot on the tray icon)
+// and shown in the settings window
 window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — נסה שוב מתפריט המגש' : 'The update failed — try again from the tray menu'));
 
 // ---------- boot ----------
@@ -1335,6 +1354,7 @@ window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — נסה �
   syncVolumeUI();
   syncToggles(init.autoStart);
   syncCountryUI();
+  window.radio.updateState().then(onUpdateInfo);
   setStation(state.settings.station, false);
   setPlayUI('paused');
   requestAnimationFrame(frame);

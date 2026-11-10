@@ -47,7 +47,12 @@
     onMetadata: (cb) => listen('metadata', (e) => cb(e.payload)),
     onSettings: (cb) => listen('settings-changed', (e) => cb(e.payload)),
     onWake: (cb) => listen('wake', () => cb()),
-    onUpdate: (cb) => listen('update-available', (e) => cb(e.payload)),
+    openSettings: () => invoke('open_settings'),
+    // settings window → backend: saves, refreshes the tray, tells the widget
+    setSettings: (patch) => invoke('set_settings', { patch }),
+    updateState: () => invoke('update_state'),
+    updateClick: () => invoke('update_click'),
+    onUpdateState: (cb) => listen('update-state', (e) => cb(e.payload)),
     onUpdateFailed: (cb) => listen('update-failed', () => cb()),
   };
 })();

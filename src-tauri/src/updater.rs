@@ -3,6 +3,8 @@
 //! that. A found update puts a green dot on the tray icon and asks once per
 //! version, in a small dialog, whether to install it now. A check started from
 //! the tray menu always answers in a dialog (update / up to date / failed).
+//! The widget's settings panel shows the same state and runs the same steps,
+//! without dialogs (it has its own status line).
 //!
 //! The installed app downloads the new installer, which updates in place and
 //! starts the app again. The portable exe has no installer to update, so it
@@ -71,14 +73,50 @@ pub fn tooltip(app: &AppHandle) -> Option<String> {
     }
 }
 
+/// Who started a check: decides which dialogs answer it.
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    Auto,  // background: asks once per version, silent otherwise
+    Tray,  // tray menu: always answers in a dialog
+    Panel, // settings panel: answers in the panel, no dialogs
+}
+
 /// The tray item (or "Yes" in the dialog) was clicked.
 pub fn on_click(app: &AppHandle) {
+    click(app, Origin::Tray);
+}
+
+/// The button in the widget's settings panel was clicked.
+pub fn on_panel_click(app: &AppHandle) {
+    click(app, Origin::Panel);
+}
+
+fn click(app: &AppHandle, origin: Origin) {
     match status(app) {
         Status::Available(_) if is_portable() => crate::open_url(RELEASES),
         Status::Available(_) => install(app.clone()),
         Status::Checking | Status::Downloading(_) => {}
-        _ => check(app.clone(), true),
+        _ => check(app.clone(), origin),
     }
+}
+
+/// The update state for the settings panel.
+pub fn info(app: &AppHandle) -> Value {
+    let (state, version, percent) = match status(app) {
+        Status::Idle => ("idle", None, 0),
+        Status::Checking => ("checking", None, 0),
+        Status::UpToDate => ("uptodate", None, 0),
+        Status::Available(v) => ("available", Some(v), 0),
+        Status::Downloading(p) => ("downloading", None, p),
+        Status::Failed => ("failed", None, 0),
+    };
+    json!({
+        "state": state,
+        "version": version,
+        "percent": percent,
+        "current": app.package_info().version.to_string(),
+        "portable": is_portable(),
+    })
 }
 
 pub fn start(app: AppHandle) {
@@ -86,7 +124,7 @@ pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio_sleep(FIRST_CHECK).await;
         loop {
-            run_check(&app, false).await;
+            run_check(&app, Origin::Auto).await;
             tokio_sleep(EVERY).await;
         }
     });
@@ -110,13 +148,18 @@ fn set(app: &AppHandle, s: Status) {
         set_badge(app, want_badge);
     }
     crate::update_tray(app);
+    if let Some(w) = crate::main_window(app) {
+        let _ = w.emit("update-state", info(app));
+    }
 }
 
-fn check(app: AppHandle, manual: bool) {
-    tauri::async_runtime::spawn(async move { run_check(&app, manual).await });
+fn check(app: AppHandle, origin: Origin) {
+    tauri::async_runtime::spawn(async move { run_check(&app, origin).await });
 }
 
-async fn run_check(app: &AppHandle, manual: bool) {
+async fn run_check(app: &AppHandle, origin: Origin) {
+    let manual = origin != Origin::Auto;
+    let dialogs = origin == Origin::Tray;
     if matches!(status(app), Status::Checking | Status::Downloading(_)) {
         return;
     }
@@ -140,24 +183,25 @@ async fn run_check(app: &AppHandle, manual: bool) {
             let v = update.version.clone();
             app.state::<Shared>().lock().unwrap().update = Some(update);
             set(app, Status::Available(v.clone()));
-            // background checks ask once per version; a manual check always answers
-            if manual || asked(app).as_deref() != Some(v.as_str()) {
+            // background checks ask once per version; a tray check always answers;
+            // the settings panel shows it itself
+            let new = asked(app).as_deref() != Some(v.as_str());
+            if manual || new {
                 remember_asked(app, &v);
-                if let Some(w) = crate::main_window(app) {
-                    let _ = w.emit("update-available", json!({ "version": v, "portable": is_portable() }));
-                }
+            }
+            if dialogs || (origin == Origin::Auto && new) {
                 dialog(app, Ask::Update(v));
             }
         }
         Ok(None) => {
             set(app, if manual { Status::UpToDate } else { idle_or(prev) });
-            if manual {
+            if dialogs {
                 dialog(app, Ask::UpToDate);
             }
         }
         Err(_) => {
             set(app, if manual { Status::Failed } else { idle_or(prev) });
-            if manual {
+            if dialogs {
                 dialog(app, Ask::Failed);
             }
         }
@@ -175,7 +219,7 @@ fn idle_or(prev: Status) -> Status {
 
 fn install(app: AppHandle) {
     let Some(update) = app.state::<Shared>().lock().unwrap().update.clone() else {
-        return check(app, true);
+        return check(app, Origin::Tray);
     };
     set(&app, Status::Downloading(0));
     tauri::async_runtime::spawn(async move {
@@ -297,7 +341,7 @@ fn dialog(app: &AppHandle, ask: Ask) {
         DIALOG_OPEN.store(false, Ordering::SeqCst);
         match ask {
             Ask::Update(_) if res == IDYES => on_click(&app),
-            Ask::Failed if res == IDRETRY => check(app, true),
+            Ask::Failed if res == IDRETRY => check(app, Origin::Tray),
             _ => {}
         }
     });

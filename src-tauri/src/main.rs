@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -69,6 +69,7 @@ type Shared = Mutex<Inner>;
 fn defaults() -> Map<String, Value> {
     json!({
         "country": "IL",
+        "countries": ["IL", "US", "GB", "CA", "AU", "IE", "NZ", "ZA"],
         "station": null,
         "volume": 0.7,
         "stayOnTop": false,
@@ -467,6 +468,7 @@ fn update_tray(app: &AppHandle) {
         let level = level_menu(app, "adlevel", "Ad volume", ad_duck, ad_level)?;
         let cduck = CheckMenuItem::with_id(app, "callduck", "Lower volume during calls", true, call_duck, None::<&str>)?;
         let clevel = level_menu(app, "calllevel", "Call volume", call_duck, call_level)?;
+        let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
         let (update_text, update_on) = updater::label(app);
         let update = MenuItem::with_id(app, "update", update_text, update_on, None::<&str>)?;
         let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -484,6 +486,7 @@ fn update_tray(app: &AppHandle) {
                 &cduck,
                 &clevel,
                 &PredefinedMenuItem::separator(app)?,
+                &settings,
                 &update,
                 &quit,
             ],
@@ -571,6 +574,7 @@ fn on_menu(app: &AppHandle, id: &str) {
         }
         "quit" => app.exit(0),
         "update" => updater::on_click(app),
+        "settings" => open_settings_window(app),
         _ => {
             let level = |prefix: &str| id.strip_prefix(prefix).and_then(|p| p.parse::<u32>().ok()).filter(|p| DUCK_LEVELS.contains(p));
             if let Some(p) = level("adlevel-") {
@@ -669,11 +673,78 @@ fn set_auto_start_cmd(app: AppHandle, on: bool) -> bool {
 
 #[tauri::command]
 fn save(app: AppHandle, state: State<Shared>, patch: Map<String, Value>) {
-    let mut g = state.lock().unwrap();
-    for (k, v) in patch {
-        g.settings.insert(k, v);
+    // the tray menu shows these too
+    let tray = ["adDuck", "adLevel", "callDuck", "callLevel"].iter().any(|k| patch.contains_key(*k));
+    {
+        let mut g = state.lock().unwrap();
+        for (k, v) in patch {
+            g.settings.insert(k, v);
+        }
+        schedule_save(&app, &mut g);
     }
-    schedule_save(&app, &mut g);
+    if tray {
+        update_tray(&app);
+    }
+}
+
+/// Several settings at once, from the settings window: saved, shown in the
+/// tray menu, and sent to the widget.
+#[tauri::command]
+fn set_settings(app: AppHandle, patch: Map<String, Value>) {
+    {
+        let st = app.state::<Shared>();
+        let mut g = st.lock().unwrap();
+        for (k, v) in &patch {
+            g.settings.insert(k.clone(), v.clone());
+        }
+        schedule_save(&app, &mut g);
+    }
+    let _ = app.emit("settings-changed", Value::Object(patch));
+    update_tray(&app);
+}
+
+/// The settings window: made when asked for and destroyed when closed, so it
+/// uses nothing in between. A second request brings the open one to the front.
+fn open_settings_window(app: &AppHandle) {
+    let app = app.clone();
+    // not on the main thread: building a window there deadlocks on Windows
+    std::thread::spawn(move || {
+        if let Some(w) = app.get_webview_window("settings") {
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+            return;
+        }
+        let on_top = stay_on_top(&app.state::<Shared>().lock().unwrap());
+        let mut b = WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App("settings.html".into()))
+            .title("Radio Widget — Settings")
+            .inner_size(380.0, 480.0)
+            .resizable(false)
+            .maximizable(false)
+            .minimizable(false)
+            .theme(Some(tauri::Theme::Dark))
+            .always_on_top(on_top) // or it would open behind a stay-on-top widget
+            .center();
+        // every webview of the app must be started with the same browser arguments
+        if let Some(args) = app.config().app.windows.first().and_then(|w| w.additional_browser_args.clone()) {
+            b = b.additional_browser_args(&args);
+        }
+        let _ = b.build();
+    });
+}
+
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    open_settings_window(&app);
+}
+
+#[tauri::command]
+fn update_state(app: AppHandle) -> Value {
+    updater::info(&app)
+}
+
+#[tauri::command]
+fn update_click(app: AppHandle) {
+    updater::on_panel_click(&app);
 }
 
 const API_HOSTS: [&str; 3] = ["de1.api.radio-browser.info", "fi1.api.radio-browser.info", "de2.api.radio-browser.info"];
@@ -845,10 +916,17 @@ fn main() {
             quit,
             hide,
             now_playing,
-            open_spotify
+            open_spotify,
+            update_state,
+            update_click,
+            set_settings,
+            open_settings
         ])
         .on_menu_event(|app, ev| on_menu(app, ev.id().as_ref()))
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return; // the settings window just closes
+            }
             let app = window.app_handle();
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
