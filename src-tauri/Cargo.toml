@@ -1,6 +1,6 @@
 [package]
 name = "radio-widget"
-version = "0.6.0"
+version = "0.5.11"
 description = "Radio widget for Windows"
 authors = ["MoshikoKar"]
 license = "MIT"
