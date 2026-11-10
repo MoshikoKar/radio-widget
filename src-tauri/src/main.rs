@@ -130,9 +130,9 @@ fn save_settings_now(app: &AppHandle) {
     write_settings(app, &snapshot);
 }
 
-/// Called by the updater right before the process exits for an in-place install.
-/// Saves settings and releases WebView2 / proxy handles so NSIS can overwrite files
-/// without sitting on "Not Responding" while locks clear.
+/// Called by the updater right before it launches the NSIS installer and
+/// `process::exit`s. Keep this fast and non-destructive: destroying windows here
+/// can tear the process down before ShellExecute runs, so the update never starts.
 fn prepare_for_update_exit(app: &AppHandle) {
     save_settings_now(app);
     proxy::stop();
@@ -140,9 +140,10 @@ fn prepare_for_update_exit(app: &AppHandle) {
         if let Some(w) = app.get_webview_window(label) {
             set_webview_hidden(&w, true);
             let _ = w.hide();
-            let _ = w.destroy();
         }
     }
+    // same cleanup the plugin installs by default (we replace that hook)
+    app.cleanup_before_exit();
 }
 
 /// Debounced save (drags fire many move events).
