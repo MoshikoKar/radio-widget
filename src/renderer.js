@@ -37,6 +37,7 @@ const state = {
   noInfo: false,
   usingProxy: false,
   dropdown: null, // 'stations' | 'country' | 'history' | null
+  occluded: false, // fully covered by another app (or hidden)
 };
 
 const regionNames = (() => {
@@ -794,14 +795,15 @@ function drawViz(c, n, step) {
 
 // Every repaint of this transparent window costs GPU time, so the visualizer
 // doesn't run at the screen's rate: 30 fps while playing, 12 fps for the idle
-// wave, nothing in logo mode or while the window is hidden. Waiting on a timer
-// between frames (not a back-to-back rAF loop) lets the compositor sleep.
+// wave, nothing in logo mode, while the window is hidden, or while another app
+// fully covers the widget. Waiting on a timer between frames (not a back-to-back
+// rAF loop) lets the compositor sleep.
 const FRAME_GAP = { playing: 1000 / 30, idle: 1000 / 12 };
 let lastDraw = 0;
 function frame(now) {
   const step = lastDraw ? Math.min(6, (now - lastDraw) / (1000 / 60)) : 1;
   lastDraw = now;
-  if (!document.hidden) {
+  if (!document.hidden && !state.occluded) {
     if (state.mode === 'expanded') drawViz(vizBig, 38, step);
     else if (state.mode === 'compact') drawViz(vizSmall, 24, step);
   }
@@ -1338,7 +1340,10 @@ if (ms) {
   }
 }
 window.radio.onWake(() => setMode('expanded'));
-// a new version is announced by the backend (dialog + dot on the tray icon)
+window.radio.onOcclusion((p) => {
+  state.occluded = !!(p && p.occluded);
+});
+// a new version is announced by the backend (Windows toast + dot on the tray icon)
 // and shown in the settings window
 window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — נסה שוב מתפריט המגש' : 'The update failed — try again from the tray menu'));
 

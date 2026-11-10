@@ -54,5 +54,6 @@
     updateClick: () => invoke('update_click'),
     onUpdateState: (cb) => listen('update-state', (e) => cb(e.payload)),
     onUpdateFailed: (cb) => listen('update-failed', () => cb()),
+    onOcclusion: (cb) => listen('widget-occlusion', (e) => cb(e.payload)),
   };
 })();

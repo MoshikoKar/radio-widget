@@ -1,16 +1,15 @@
 //! Update check against the latest GitHub release (`latest.json`, signed with
 //! the project's update key). Runs shortly after launch and once a day after
 //! that. A found update puts a green dot on the tray icon and asks once per
-//! version, in a small dialog, whether to install it now. A check started from
-//! the tray menu always answers in a dialog (update / up to date / failed).
-//! The widget's settings panel shows the same state and runs the same steps,
-//! without dialogs (it has its own status line).
+//! version, via a Windows notification-center toast, whether to install it now.
+//! A check started from the tray menu always answers with a toast (update /
+//! up to date / failed). The widget's settings panel shows the same state and
+//! runs the same steps, without toasts (it has its own status line).
 //!
 //! The installed app downloads the new installer, which updates in place and
 //! starts the app again. The portable exe has no installer to update, so it
 //! opens the release page instead.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -19,14 +18,13 @@ use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::toast::{self, ToastActions};
+
 const FIRST_CHECK: Duration = Duration::from_secs(15);
 const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const RELEASES: &str = "https://github.com/MoshikoKar/radio-widget/releases/latest";
 /// Settings key: the last version the user was asked about (survives restarts).
 const ASKED_KEY: &str = "updateAsked";
-
-/// Only one update dialog at a time.
-static DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, PartialEq)]
 pub enum Status {
@@ -73,15 +71,15 @@ pub fn tooltip(app: &AppHandle) -> Option<String> {
     }
 }
 
-/// Who started a check: decides which dialogs answer it.
+/// Who started a check: decides which toasts answer it.
 #[derive(Clone, Copy, PartialEq)]
 enum Origin {
     Auto,  // background: asks once per version, silent otherwise
-    Tray,  // tray menu: always answers in a dialog
-    Panel, // settings panel: answers in the panel, no dialogs
+    Tray,  // tray menu: always answers with a toast
+    Panel, // settings panel: answers in the panel, no toasts
 }
 
-/// The tray item (or "Yes" in the dialog) was clicked.
+/// The tray item (or "Update" in the toast) was clicked.
 pub fn on_click(app: &AppHandle) {
     click(app, Origin::Tray);
 }
@@ -121,6 +119,7 @@ pub fn info(app: &AppHandle) -> Value {
 
 pub fn start(app: AppHandle) {
     app.manage::<Shared>(Mutex::new(State::default()));
+    toast::init();
     tauri::async_runtime::spawn(async move {
         tokio_sleep(FIRST_CHECK).await;
         loop {
@@ -159,7 +158,7 @@ fn check(app: AppHandle, origin: Origin) {
 
 async fn run_check(app: &AppHandle, origin: Origin) {
     let manual = origin != Origin::Auto;
-    let dialogs = origin == Origin::Tray;
+    let toasts = origin == Origin::Tray;
     if matches!(status(app), Status::Checking | Status::Downloading(_)) {
         return;
     }
@@ -171,8 +170,8 @@ async fn run_check(app: &AppHandle, origin: Origin) {
     let found = async {
         let save = app.clone();
         app.updater_builder()
-            // the installer closes the app: write any pending settings first
-            .on_before_exit(move || crate::save_settings_now(&save))
+            // the installer closes the app: release locks before NSIS overwrites files
+            .on_before_exit(move || crate::prepare_for_update_exit(&save))
             .build()?
             .check()
             .await
@@ -189,20 +188,20 @@ async fn run_check(app: &AppHandle, origin: Origin) {
             if manual || new {
                 remember_asked(app, &v);
             }
-            if dialogs || (origin == Origin::Auto && new) {
-                dialog(app, Ask::Update(v));
+            if toasts || (origin == Origin::Auto && new) {
+                notify(app, Ask::Update(v));
             }
         }
         Ok(None) => {
             set(app, if manual { Status::UpToDate } else { idle_or(prev) });
-            if dialogs {
-                dialog(app, Ask::UpToDate);
+            if toasts {
+                notify(app, Ask::UpToDate);
             }
         }
         Err(_) => {
             set(app, if manual { Status::Failed } else { idle_or(prev) });
-            if dialogs {
-                dialog(app, Ask::Failed);
+            if toasts {
+                notify(app, Ask::Failed);
             }
         }
     }
@@ -298,53 +297,75 @@ fn with_dot(base: &Image<'_>) -> Image<'static> {
     Image::new_owned(px, w as u32, h as u32)
 }
 
-// ---------- dialogs ----------
+// ---------- notification-center toasts ----------
 enum Ask {
     Update(String),
     UpToDate,
     Failed,
 }
 
-/// Native message box on its own thread (it blocks until answered).
-fn dialog(app: &AppHandle, ask: Ask) {
-    if DIALOG_OPEN.swap(true, Ordering::SeqCst) {
-        return;
-    }
+fn notify(app: &AppHandle, ask: Ask) {
     let app = app.clone();
-    std::thread::spawn(move || {
-        use windows::core::HSTRING;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            MessageBoxW, IDRETRY, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_RETRYCANCEL, MB_SETFOREGROUND,
-            MB_TOPMOST, MB_YESNO,
-        };
-        let cur = app.package_info().version.to_string();
-        let (text, flags) = match &ask {
-            Ask::Update(v) if is_portable() => (
-                format!("Radio Widget {v} is available (you have {cur}).\n\nOpen the download page now?"),
-                MB_YESNO | MB_ICONINFORMATION,
-            ),
-            Ask::Update(v) => (
-                format!(
-                    "Radio Widget {v} is available (you have {cur}).\n\nUpdate now? The widget restarts by itself when it's done.\n\nChoose No to update later from the tray icon."
-                ),
-                MB_YESNO | MB_ICONINFORMATION,
-            ),
-            Ask::UpToDate => (format!("You have the latest version ({cur})."), MB_OK | MB_ICONINFORMATION),
-            Ask::Failed => (
-                "Couldn't check for updates. Check your internet connection and try again.".to_string(),
-                MB_RETRYCANCEL | MB_ICONERROR,
-            ),
-        };
-        let res = unsafe {
-            MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("Radio Widget"), flags | MB_TOPMOST | MB_SETFOREGROUND)
-        };
-        DIALOG_OPEN.store(false, Ordering::SeqCst);
-        match ask {
-            Ask::Update(_) if res == IDYES => on_click(&app),
-            Ask::Failed if res == IDRETRY => check(app, Origin::Tray),
-            _ => {}
+    let cur = app.package_info().version.to_string();
+    match ask {
+        Ask::Update(v) if is_portable() => {
+            let body = format!("Radio Widget {v} is available (you have {cur}). Open the download page?");
+            toast::show(
+                "Update available",
+                &body,
+                Some(ToastActions {
+                    primary: ("Open", "update"),
+                    secondary: Some(("Later", "later")),
+                }),
+                move |args| {
+                    if args == "update" || args == "default" {
+                        on_click(&app);
+                    }
+                },
+            );
         }
-    });
+        Ask::Update(v) => {
+            let body = format!(
+                "Radio Widget {v} is available (you have {cur}). Update now? The widget restarts when it's done."
+            );
+            toast::show(
+                "Update available",
+                &body,
+                Some(ToastActions {
+                    primary: ("Update", "update"),
+                    secondary: Some(("Later", "later")),
+                }),
+                move |args| {
+                    if args == "update" || args == "default" {
+                        on_click(&app);
+                    }
+                },
+            );
+        }
+        Ask::UpToDate => {
+            toast::show(
+                "Radio Widget",
+                &format!("You have the latest version ({cur})."),
+                None,
+                |_| {},
+            );
+        }
+        Ask::Failed => {
+            toast::show(
+                "Update check failed",
+                "Couldn't check for updates. Check your internet connection and try again.",
+                Some(ToastActions {
+                    primary: ("Retry", "retry"),
+                    secondary: None,
+                }),
+                move |args| {
+                    if args == "retry" || args == "default" {
+                        check(app.clone(), Origin::Tray);
+                    }
+                },
+            );
+        }
+    }
 }
 
 fn asked(app: &AppHandle) -> Option<String> {

@@ -6,7 +6,9 @@
 
 mod calls;
 mod http;
+mod occlusion;
 mod proxy;
+mod toast;
 mod updater;
 
 use serde::Deserialize;
@@ -126,6 +128,21 @@ fn write_settings(app: &AppHandle, s: &Map<String, Value>) {
 fn save_settings_now(app: &AppHandle) {
     let snapshot = app.state::<Shared>().lock().unwrap().settings.clone();
     write_settings(app, &snapshot);
+}
+
+/// Called by the updater right before the process exits for an in-place install.
+/// Saves settings and releases WebView2 / proxy handles so NSIS can overwrite files
+/// without sitting on "Not Responding" while locks clear.
+fn prepare_for_update_exit(app: &AppHandle) {
+    save_settings_now(app);
+    proxy::stop();
+    for label in ["settings", "main"] {
+        if let Some(w) = app.get_webview_window(label) {
+            set_webview_hidden(&w, true);
+            let _ = w.hide();
+            let _ = w.destroy();
+        }
+    }
 }
 
 /// Debounced save (drags fire many move events).
@@ -704,14 +721,13 @@ fn set_settings(app: AppHandle, patch: Map<String, Value>) {
 }
 
 /// The settings window: made when asked for and destroyed when closed, so it
-/// uses nothing in between. A second request brings the open one to the front.
+/// uses nothing in between. A second request closes it (gear toggles).
 fn open_settings_window(app: &AppHandle) {
     let app = app.clone();
     // not on the main thread: building a window there deadlocks on Windows
     std::thread::spawn(move || {
         if let Some(w) = app.get_webview_window("settings") {
-            let _ = w.unminimize();
-            let _ = w.set_focus();
+            let _ = w.close();
             return;
         }
         let on_top = stay_on_top(&app.state::<Shared>().lock().unwrap());
@@ -995,6 +1011,7 @@ fn main() {
                 })
                 .build(app)?;
             updater::start(handle.clone());
+            occlusion::start(handle.clone());
             update_tray(&handle);
             Ok(())
         })

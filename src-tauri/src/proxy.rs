@@ -10,10 +10,14 @@ use crate::http;
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+
+static PORT: AtomicU16 = AtomicU16::new(0);
+static LISTENER: Mutex<Option<TcpListener>> = Mutex::new(None);
+static GEN: Mutex<Option<Arc<AtomicU64>>> = Mutex::new(None);
 
 #[derive(Serialize, Clone)]
 struct Meta {
@@ -29,10 +33,20 @@ struct Meta {
 pub fn start(app: AppHandle) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    PORT.store(port, Ordering::SeqCst);
+    // keep a handle so `stop` can drop it and wake `incoming`
+    if let Ok(clone) = listener.try_clone() {
+        *LISTENER.lock().unwrap() = Some(clone);
+    }
     // only one stream plays at a time: a new request ends the previous one
     let generation = Arc::new(AtomicU64::new(0));
+    *GEN.lock().unwrap() = Some(generation.clone());
     std::thread::spawn(move || {
-        for conn in listener.incoming().flatten() {
+        for conn in listener.incoming() {
+            if LISTENER.lock().unwrap().is_none() {
+                break;
+            }
+            let Ok(conn) = conn else { break };
             let app = app.clone();
             let gen = generation.clone();
             std::thread::spawn(move || {
@@ -41,6 +55,21 @@ pub fn start(app: AppHandle) -> u16 {
         }
     });
     port
+}
+
+/// Ends active stream copies and closes the listener (update install exit path).
+pub fn stop() {
+    if let Some(g) = GEN.lock().unwrap().as_ref() {
+        g.fetch_add(1, Ordering::SeqCst);
+    }
+    let _ = LISTENER.lock().unwrap().take();
+    let port = PORT.swap(0, Ordering::SeqCst);
+    if port != 0 {
+        let _ = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(50),
+        );
+    }
 }
 
 fn handle(mut client: TcpStream, app: AppHandle, gen: Arc<AtomicU64>) -> std::io::Result<()> {
