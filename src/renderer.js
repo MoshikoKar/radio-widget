@@ -158,6 +158,7 @@ function play() {
   actx.resume();
   resetAd();
   clearTimeout(releaseTimer);
+  stopSilenceWatch();
   state.streamId += 1;
   state.artist = '';
   state.song = '';
@@ -208,6 +209,7 @@ const RELEASE_AFTER_MS = 5 * 60 * 1000;
 let releaseTimer = null;
 function stop() {
   clearTimeout(skipTimer);
+  stopSilenceWatch();
   resetAd();
   state.streamId += 1; // ignore metadata still trickling in from the paused stream
   audio.pause();
@@ -239,18 +241,29 @@ for (const a of [audio, direct]) {
     playedSid = state.streamId;
     state.playing = true;
     setPlayUI('playing');
+    startSilenceWatch();
   });
   a.addEventListener('waiting', () => {
     if (a === current() && a.getAttribute('src')) setPlayUI('buffering');
   });
+  a.addEventListener('ended', () => {
+    if (a !== current() || !a.getAttribute('src')) return;
+    // stream finished without staying live - treat as dead
+    const sid = state.streamId;
+    clearTimeout(skipTimer);
+    stopSilenceWatch();
+    skipTimer = setTimeout(() => skipDead(sid, true), SKIP_ON_ERROR_MS);
+  });
   a.addEventListener('error', () => {
     if (a !== current() || !a.getAttribute('src')) return;
     if (a === audio) {
+      stopSilenceWatch(); // analyser goes quiet while direct takes over
       playDirect(); // proxy couldn't handle this server — play the URL directly (no song info)
       return;
     }
     state.playing = false;
     setPlayUI('error');
+    stopSilenceWatch();
     // the stream is down: move on after a moment, so the error is seen
     const sid = state.streamId;
     clearTimeout(skipTimer);
@@ -258,20 +271,76 @@ for (const a of [audio, direct]) {
   });
 }
 
-// A station that hasn't started playing within 15 s (or whose stream fails)
-// is skipped for a random one. After a few dead stations in a row it stops
-// trying, and nothing is skipped while Windows reports no network.
+// A station that hasn't started playing within 15 s, whose stream fails, or
+// that goes silent for 5 s after it did start, is skipped for a random one.
+// After a few dead stations in a row it stops trying, and nothing is skipped
+// while Windows reports no network.
 const SKIP_AFTER_MS = 15000;
 const SKIP_ON_ERROR_MS = 2500;
+const SILENCE_SKIP_MS = 5000;
+const SILENCE_POLL_MS = 250;
+const SILENCE_PEAK_MAX = 4; // analyser bins at/under this count as silent
 const MAX_AUTO_SKIPS = 5;
 let skipTimer = null;
 let autoSkips = 0;
 let playedSid = -1; // the last stream that actually started playing
 // (state.playing can't tell: it stays true while switching from a playing station)
+let silenceWatch = null;
+let silenceSince = 0;
+let silenceLastTime = -1;
+
+function stopSilenceWatch() {
+  clearInterval(silenceWatch);
+  silenceWatch = null;
+  silenceSince = 0;
+  silenceLastTime = -1;
+}
+
+function startSilenceWatch() {
+  stopSilenceWatch();
+  silenceWatch = setInterval(checkSilence, SILENCE_POLL_MS);
+}
+
+function isStreamSilent() {
+  // Proxy path feeds Web Audio: real level from the analyser (pre-gain, so mute/duck don't matter).
+  // Direct path is often cross-origin and can't join the graph - watch currentTime instead.
+  if (state.usingProxy && analyser && freq) {
+    analyser.getByteFrequencyData(freq);
+    let peak = 0;
+    for (let i = 0; i < freq.length; i++) if (freq[i] > peak) peak = freq[i];
+    return peak <= SILENCE_PEAK_MAX;
+  }
+  const a = current();
+  if (!a || a.ended) return true;
+  const t = a.currentTime;
+  const stuck = t === silenceLastTime;
+  silenceLastTime = t;
+  return stuck;
+}
+
+function checkSilence() {
+  if (!state.playing || !state.station) return;
+  if (!navigator.onLine) {
+    silenceSince = 0;
+    return;
+  }
+  if (!isStreamSilent()) {
+    silenceSince = 0;
+    return;
+  }
+  const now = Date.now();
+  if (!silenceSince) silenceSince = now;
+  if (now - silenceSince < SILENCE_SKIP_MS) return;
+  const sid = state.streamId;
+  stopSilenceWatch();
+  skipDead(sid, true);
+}
+
 function skipDead(sid, failed = false) {
   if (sid !== state.streamId || !state.station) return;
   if (!failed && playedSid === sid) return; // it started in time
   if (!navigator.onLine) return;
+  stopSilenceWatch();
   const name = state.station.name;
   if (autoSkips >= MAX_AUTO_SKIPS) {
     autoSkips = 0;
@@ -654,9 +723,21 @@ function renderNowPlaying() {
   reportNowPlaying();
 }
 
+// Keep the flag / country list on the station's country (favorites and media
+// next/prev can land on another country without going through the flag picker).
+function followStationCountry(st) {
+  const cc = st && st.countrycode && String(st.countrycode).toUpperCase();
+  if (!cc || !/^[A-Z]{2}$/.test(cc) || cc === state.settings.country) return false;
+  state.settings.country = cc;
+  window.radio.save({ country: cc });
+  syncCountryUI();
+  return true;
+}
+
 function setStation(st, autoplay = true) {
   state.station = st ? slimStation(st) : null;
   window.radio.save({ station: state.station });
+  if (followStationCountry(state.station)) loadStations();
   for (const id of ['#logoBig', '#logoSmall', '#logoTile']) renderLogo($(id), state.station);
   renderNowPlaying();
   if (autoplay) play();
@@ -687,15 +768,18 @@ async function playRandom() {
   let pool = [];
   const left = [...myCountries()];
   btn.classList.add('busy');
-  while (left.length && !pool.length) {
-    cc = left.splice(randomIndex(left.length), 1)[0];
-    try {
-      pool = (await fetchStations(cc)).filter((s) => s.stationuuid !== curId);
-    } catch {
-      pool = [];
+  try {
+    while (left.length && !pool.length) {
+      cc = left.splice(randomIndex(left.length), 1)[0];
+      try {
+        pool = (await fetchStations(cc)).filter((s) => s.stationuuid !== curId);
+      } catch {
+        pool = [];
+      }
     }
+  } finally {
+    btn.classList.remove('busy');
   }
-  btn.classList.remove('busy');
   if (!pool.length) return toast(HE ? 'אין תחנות להגרלה' : 'No stations to pick from');
 
   // remember up to half the pool (max 40) so repeats stay rare but possible

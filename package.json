@@ -1,6 +1,6 @@
 {
   "name": "radio-widget",
-  "version": "0.5.13",
+  "version": "0.5.14",
   "private": true,
   "description": "Radio widget for Windows (Tauri)",
   "license": "MIT",
