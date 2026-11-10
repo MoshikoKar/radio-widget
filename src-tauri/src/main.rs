@@ -449,7 +449,8 @@ fn update_tray(app: &AppHandle) {
             level("callLevel"),
         )
     };
-    let tip: Vec<&str> = ["Radio Widget", np.station.as_str(), np.title.as_str()]
+    let update_tip = updater::tooltip(app).unwrap_or_default();
+    let tip: Vec<&str> = ["Radio Widget", np.station.as_str(), np.title.as_str(), update_tip.as_str()]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect();

@@ -1320,11 +1320,7 @@ if (ms) {
   }
 }
 window.radio.onWake(() => setMode('expanded'));
-// a new version was found (the tray menu installs it)
-window.radio.onUpdate(({ version, portable }) => {
-  if (portable) toast(HE ? `גרסה ${version} זמינה — להורדה מתפריט הסמל במגש` : `Version ${version} is out — download it from the tray menu`);
-  else toast(HE ? `גרסה ${version} זמינה — לעדכון מתפריט הסמל במגש` : `Version ${version} is out — update from the tray menu`);
-});
+// a new version is announced by the backend (dialog + dot on the tray icon)
 window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — נסה שוב מתפריט המגש' : 'The update failed — try again from the tray menu'));
 
 // ---------- boot ----------
