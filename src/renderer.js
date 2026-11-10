@@ -7,6 +7,9 @@ const LOGO_HOVER_DELAY_MS = 600;
 
 const $ = (sel) => document.querySelector(sel);
 const body = document.body;
+// Windows set to Hebrew: the widget's own texts are in Hebrew too
+const HE = /^he\b/i.test(navigator.language);
+const tx = (en, he) => (HE ? he : en);
 
 // ---------- icons ----------
 function paintIcons(root = document) {
@@ -19,6 +22,26 @@ function setIcon(node, name) {
   node.innerHTML = ICONS[name];
 }
 paintIcons();
+if (HE) {
+  const titles = {
+    '#liveDot': 'שידור חי',
+    '#btnCollapse': 'מזעור',
+    '#btnClose': 'הסתרה (ממשיך לנגן; יציאה מסמל המגש)',
+    '#btnShuffle': 'תחנה אקראית',
+    '#btnSpotify': 'פתיחה ב-Spotify',
+    '.row-icon[data-icon="note"]': 'שיר',
+    '.row-icon[data-icon="mic"]': 'אמן',
+    '#btnMuteBig': 'השתקה',
+    '#btnStations': 'תחנות',
+    '#btnHistory': 'הושמעו לאחרונה',
+    '#btnExpand': 'הרחבה',
+  };
+  for (const [sel, title] of Object.entries(titles)) {
+    const n = document.querySelector(sel);
+    if (n) n.title = title;
+  }
+}
+const COPY_HINT = tx('(click to copy)', '(לחיצה להעתקה)');
 
 // ---------- state ----------
 const state = {
@@ -35,6 +58,7 @@ const state = {
   song: '',
   streamId: 0,
   noInfo: false,
+  proxyKey: '',
   usingProxy: false,
   dropdown: null, // 'stations' | 'country' | 'history' | null
   occluded: false, // fully covered by another app (or hidden)
@@ -82,6 +106,7 @@ function renderLogo(node, station) {
   const img = new Image();
   img.referrerPolicy = 'no-referrer';
   img.decoding = 'async';
+  img.loading = 'lazy'; // a long station list only fetches the logos scrolled into view
   img.onerror = fallback;
   img.onload = () => {
     if (img.naturalWidth < 8) fallback();
@@ -145,7 +170,7 @@ function applyVolume(ramp = 0.02) {
 }
 
 function proxyUrl(url) {
-  return `http://127.0.0.1:${state.proxyPort}/stream?id=${state.streamId}&u=${encodeURIComponent(url)}`;
+  return `http://127.0.0.1:${state.proxyPort}/stream?k=${state.proxyKey}&id=${state.streamId}&u=${encodeURIComponent(url)}`;
 }
 
 function play() {
@@ -154,6 +179,9 @@ function play() {
     else openDropdown('stations');
     return;
   }
+  wantPlaying = true;
+  needsResume = false;
+  clearTimeout(resumeTimer);
   ensureGraph();
   actx.resume();
   resetAd();
@@ -208,6 +236,8 @@ function silence(a) {
 const RELEASE_AFTER_MS = 5 * 60 * 1000;
 let releaseTimer = null;
 function stop() {
+  wantPlaying = false;
+  resetRecovery();
   clearTimeout(skipTimer);
   stopSilenceWatch();
   resetAd();
@@ -227,7 +257,7 @@ function stop() {
 function togglePlay() {
   if (state.playing || $('#btnPlayBig').classList.contains('buffering')) stop();
   else {
-    autoSkips = 0;
+    resetRecovery();
     play();
   }
 }
@@ -237,11 +267,21 @@ for (const a of [audio, direct]) {
   a.addEventListener('playing', () => {
     if (a !== current()) return;
     clearTimeout(skipTimer);
-    autoSkips = 0;
     playedSid = state.streamId;
     state.playing = true;
+    probing = false;
     setPlayUI('playing');
     startSilenceWatch();
+    // it counts as working once it has kept playing for a while: a station
+    // that starts and goes silent again must not get retries forever
+    const sid = state.streamId;
+    clearTimeout(stableTimer);
+    stableTimer = setTimeout(() => {
+      if (sid !== state.streamId || !state.playing) return;
+      sameRetries = 0;
+      autoSkips = 0;
+      giveUps = 0;
+    }, STABLE_AFTER_MS);
   });
   a.addEventListener('waiting', () => {
     if (a === current() && a.getAttribute('src')) setPlayUI('buffering');
@@ -272,17 +312,42 @@ for (const a of [audio, direct]) {
 }
 
 // A station that hasn't started playing within 15 s, whose stream fails, or
-// that goes silent for 5 s after it did start, is skipped for a random one.
-// After a few dead stations in a row it stops trying, and nothing is skipped
-// while Windows reports no network.
+// that goes silent for 5 s after it did start, is first reconnected (a short
+// network hiccup is the usual reason), and only then skipped for a random one.
+// A station picked that way is a stand-in: the user's own station stays saved,
+// and comes back when all else fails and on the next start. After a few dead
+// stations in a row it stops, then quietly tries the user's station once a
+// minute for a while. Nothing is skipped while Windows reports no network;
+// playback resumes when it's back.
 const SKIP_AFTER_MS = 15000;
 const SKIP_ON_ERROR_MS = 2500;
 const SILENCE_SKIP_MS = 5000;
 const SILENCE_POLL_MS = 250;
 const SILENCE_PEAK_MAX = 4; // analyser bins at/under this count as silent
 const MAX_AUTO_SKIPS = 5;
+const SAME_RETRIES = 2; // reconnects to the same station before moving on
+const STABLE_AFTER_MS = 30000;
+const PROBE_EVERY_MS = 60000;
+const MAX_PROBES = 15;
 let skipTimer = null;
 let autoSkips = 0;
+let sameRetries = 0;
+let stableTimer = null;
+let wantPlaying = false; // the user pressed play and hasn't stopped since
+let needsResume = false; // the stream died while Windows had no network
+let homeStation = null; // the station the user chose (auto-skips don't replace it)
+let probing = false; // a quiet retry of the user's station after giving up
+let giveUps = 0;
+let resumeTimer = null;
+function resetRecovery() {
+  autoSkips = 0;
+  sameRetries = 0;
+  giveUps = 0;
+  probing = false;
+  needsResume = false;
+  clearTimeout(resumeTimer);
+  clearTimeout(stableTimer);
+}
 let playedSid = -1; // the last stream that actually started playing
 // (state.playing can't tell: it stays true while switching from a playing station)
 let silenceWatch = null;
@@ -339,21 +404,64 @@ function checkSilence() {
 function skipDead(sid, failed = false) {
   if (sid !== state.streamId || !state.station) return;
   if (!failed && playedSid === sid) return; // it started in time
-  if (!navigator.onLine) return;
-  stopSilenceWatch();
-  const name = state.station.name;
-  if (autoSkips >= MAX_AUTO_SKIPS) {
-    autoSkips = 0;
-    silence(audio);
-    silence(direct);
-    state.playing = false;
-    setPlayUI('error');
-    return toast(HE ? 'כמה תחנות ברצף לא ניגנו — עצרתי' : 'Several stations in a row didn’t play — stopped');
+  if (!navigator.onLine) {
+    needsResume = true; // picked up by the 'online' listener
+    return;
   }
+  stopSilenceWatch();
+  if (probing) return giveUp(true);
+  const name = state.station.name;
+  if (sameRetries < SAME_RETRIES) {
+    sameRetries += 1;
+    toast(HE ? `${name} — מתחבר מחדש…` : `${name} — reconnecting…`);
+    return play();
+  }
+  if (autoSkips >= MAX_AUTO_SKIPS) return giveUp(false);
   autoSkips += 1;
   toast(HE ? `${name} לא מנגנת — עובר לתחנה אחרת` : `${name} isn’t playing — trying another station`);
-  playRandom();
+  playRandom(true);
 }
+
+// Nothing plays: show the error on the user's own station, and keep trying it
+// once a minute for a while (the internet may be down behind the router).
+function giveUp(quiet) {
+  probing = false;
+  autoSkips = 0;
+  clearTimeout(skipTimer);
+  stopSilenceWatch();
+  silence(audio);
+  silence(direct);
+  state.streamId += 1;
+  state.playing = false;
+  state.artist = '';
+  state.song = '';
+  if (homeStation && (!state.station || state.station.stationuuid !== homeStation.stationuuid)) {
+    setStation(homeStation, false, true);
+  }
+  setPlayUI('error');
+  if (!quiet) toast(HE ? 'כמה תחנות ברצף לא ניגנו — עצרתי' : 'Several stations in a row didn’t play — stopped');
+  clearTimeout(resumeTimer);
+  if (!wantPlaying || giveUps >= MAX_PROBES) return;
+  giveUps += 1;
+  resumeTimer = setTimeout(() => {
+    if (!wantPlaying || state.playing || !state.station) return;
+    probing = true;
+    play();
+  }, PROBE_EVERY_MS);
+}
+
+// Back online: pick up where the stream died.
+window.addEventListener('online', () => {
+  if (!wantPlaying || !state.station) return;
+  if (!needsResume && state.playing) return;
+  clearTimeout(resumeTimer);
+  resumeTimer = setTimeout(() => {
+    if (!wantPlaying || !navigator.onLine || !state.station) return;
+    if (!needsResume && state.playing) return;
+    resetRecovery();
+    play();
+  }, 2000); // the adapter is up a moment before the connection works
+});
 
 function setPlayUI(kind) {
   const playing = kind === 'playing' || kind === 'buffering';
@@ -362,13 +470,13 @@ function setPlayUI(kind) {
     btn.classList.toggle('buffering', kind === 'buffering');
     btn.classList.toggle('error', kind === 'error');
     setIcon(btn.firstElementChild, kind === 'error' ? 'warn' : playing ? 'pause' : 'play');
-    btn.title = kind === 'error' ? 'Stream unavailable — retry' : playing ? 'Pause' : 'Play';
+    btn.title = kind === 'error' ? tx('Stream unavailable — retry', 'התחנה לא זמינה — ניסיון נוסף') : playing ? tx('Pause', 'השהיה') : tx('Play', 'נגינה');
   }
   reportNowPlaying();
 }
 
 // ---------- now playing ----------
-const NO_INFO_TEXT = /^he\b/i.test(navigator.language) ? 'התחנה לא משדרת שם שיר' : 'Station doesn’t share song info';
+const NO_INFO_TEXT = HE ? 'התחנה לא משדרת שם שיר' : 'Station doesn’t share song info';
 
 // Filler that some CDNs / stations put in StreamTitle instead of a real song:
 // "Powered by…", a bare "Live", or a status word ("מנגן", "Now playing"),
@@ -647,7 +755,7 @@ function syncFavUI() {
   const on = isFav(state.station);
   b.hidden = !state.station;
   b.setAttribute('aria-pressed', String(on));
-  b.title = on ? 'Remove from favorites' : 'Add to favorites';
+  b.title = on ? tx('Remove from favorites', 'הסרה מהמועדפים') : tx('Add to favorites', 'הוספה למועדפים');
 }
 $('#btnFav').addEventListener('click', () => toggleFav(state.station));
 
@@ -680,7 +788,6 @@ for (const id of ['#songText', '#artistText', '#vizSmall']) {
   });
 }
 
-const HE = /^he\b/i.test(navigator.language);
 const AD_TEXT = HE ? 'פרסומות · הווליום הונמך' : 'Ads · volume lowered';
 const AD_TIP = HE ? 'לחיצה מחזירה את הווליום עד סוף הפרסומות' : 'Click to restore the volume for this break';
 const CALL_TEXT = HE ? 'שיחה פעילה · הווליום הונמך' : 'On a call · volume lowered';
@@ -700,8 +807,7 @@ function renderNowPlaying() {
   syncFavUI();
   $('.info').classList.toggle('noinfo', noInfo);
   $('#songText').textContent = noInfo ? NO_INFO_TEXT : state.song || '—';
-  const copyTip = songLine() ? `${songLine()}
-(click to copy)` : '';
+  const copyTip = songLine() ? `${songLine()}\n${COPY_HINT}` : '';
   $('#songText').title = copyTip;
   $('#songText').classList.toggle('can-copy', !!songLine());
   $('#artistText').classList.toggle('can-copy', !!songLine());
@@ -716,28 +822,33 @@ function renderNowPlaying() {
   const tip = adShown
     ? `${duckText}\n${duckTip}`
     : [state.artist, state.song].filter(Boolean).join(' — ') || (st ? (noInfo ? `${st.name} · ${NO_INFO_TEXT}` : st.name) : '');
-  $('#vizSmall').title = songLine() && !adShown ? `${tip}
-(click to copy)` : tip;
-  $('#btnLogoSmall').title = st ? st.name : 'Stations';
+  $('#vizSmall').title = songLine() && !adShown ? `${tip}\n${COPY_HINT}` : tip;
+  $('#btnLogoSmall').title = st ? st.name : tx('Stations', 'תחנות');
   $('#logoView').title = st ? [st.name, tip !== st.name ? tip : ''].filter(Boolean).join('\n') : '';
   reportNowPlaying();
 }
 
 // Keep the flag / country list on the station's country (favorites and media
 // next/prev can land on another country without going through the flag picker).
-function followStationCountry(st) {
+function followStationCountry(st, auto = false) {
   const cc = st && st.countrycode && String(st.countrycode).toUpperCase();
   if (!cc || !/^[A-Z]{2}$/.test(cc) || cc === state.settings.country) return false;
   state.settings.country = cc;
-  window.radio.save({ country: cc });
+  if (!auto) window.radio.save({ country: cc });
   syncCountryUI();
   return true;
 }
 
-function setStation(st, autoplay = true) {
+// `auto`: picked by the dead-station skip, not by the user. It plays, but
+// isn't saved: the user's own station is what the next start comes back to.
+function setStation(st, autoplay = true, auto = false) {
   state.station = st ? slimStation(st) : null;
-  window.radio.save({ station: state.station });
-  if (followStationCountry(state.station)) loadStations();
+  if (!auto) {
+    homeStation = state.station;
+    resetRecovery();
+    window.radio.save({ station: state.station });
+  }
+  if (followStationCountry(state.station, auto)) loadStations();
   for (const id of ['#logoBig', '#logoSmall', '#logoTile']) renderLogo($(id), state.station);
   renderNowPlaying();
   if (autoplay) play();
@@ -758,7 +869,7 @@ function randomIndex(n) {
   return buf[0] % n;
 }
 
-async function playRandom() {
+async function playRandom(auto = false) {
   const btn = $('#btnShuffle');
   if (btn.classList.contains('busy')) return;
   const curId = state.station && state.station.stationuuid;
@@ -780,7 +891,10 @@ async function playRandom() {
   } finally {
     btn.classList.remove('busy');
   }
-  if (!pool.length) return toast(HE ? 'אין תחנות להגרלה' : 'No stations to pick from');
+  if (!pool.length) {
+    if (auto) return giveUp(false); // the directory can't be reached either
+    return toast(HE ? 'אין תחנות להגרלה' : 'No stations to pick from');
+  }
 
   // remember up to half the pool (max 40) so repeats stay rare but possible
   const memory = Math.min(40, Math.floor(pool.length / 2));
@@ -796,12 +910,12 @@ async function playRandom() {
   if (cc !== state.settings.country) {
     // follow the station: flag and stations list now show its country
     state.settings.country = cc;
-    window.radio.save({ country: cc });
+    if (!auto) window.radio.save({ country: cc });
     syncCountryUI();
   }
   state.stations = await fetchStations(cc);
   state.stationsCountry = cc;
-  setStation(pick, true);
+  setStation(pick, true, auto);
 }
 
 // ---------- visualizer ----------
@@ -942,7 +1056,7 @@ function syncVolumeUI() {
   for (const s of [$('#volBig'), $('#volSmall')]) {
     s.value = pct;
     s.style.setProperty('--val', pct + '%');
-    s.title = `Volume ${pct}%`;
+    s.title = `${tx('Volume', 'ווליום')} ${pct}%`;
   }
   setIcon($('#btnMuteBig'), state.muted || pct === 0 ? 'mute' : 'volume');
 }
@@ -952,7 +1066,11 @@ function onVolumeInput(e) {
   const ducked = duckFactor() < 1;
   if (ducked) liftDuck();
   state.settings.volume = Number(e.target.value) / 100;
-  state.muted = false;
+  if (state.muted) {
+    state.muted = false;
+    state.settings.muted = false;
+    window.radio.save({ muted: false });
+  }
   syncVolumeUI();
   applyVolume();
   saveVolume();
@@ -971,8 +1089,11 @@ for (const s of [$('#volBig'), $('#volSmall')]) {
     onVolumeInput({ target: s });
   });
 }
+// mute is kept across restarts, and is also in the tray menu (any mode)
 $('#btnMuteBig').addEventListener('click', () => {
   state.muted = !state.muted;
+  state.settings.muted = state.muted;
+  window.radio.save({ muted: state.muted });
   syncVolumeUI();
   applyVolume();
 });
@@ -980,10 +1101,11 @@ $('#btnMuteBig').addEventListener('click', () => {
 // ---------- toggles ----------
 function syncToggles(autoStart) {
   $('#btnPin').setAttribute('aria-pressed', String(!!state.settings.stayOnTop));
-  $('#btnPin').title = state.settings.stayOnTop ? 'Stay on top: on' : 'Stay on top: off';
+  const onOff = (on) => (on ? tx('on', 'פעיל') : tx('off', 'כבוי'));
+  $('#btnPin').title = `${tx('Stay on top', 'תמיד מעל')}: ${onOff(state.settings.stayOnTop)}`;
   if (autoStart !== undefined) {
     $('#btnAuto').setAttribute('aria-pressed', String(!!autoStart));
-    $('#btnAuto').title = autoStart ? 'Start with Windows: on' : 'Start with Windows: off';
+    $('#btnAuto').title = `${tx('Start with Windows', 'הפעלה עם Windows')}: ${onOff(autoStart)}`;
   }
 }
 $('#btnPin').addEventListener('click', async () => {
@@ -1063,7 +1185,7 @@ function listState(kind, what, retry) {
   if (what === 'loading') box.appendChild(el('div', 'spinner'));
   else if (what === 'error') {
     const b = el('button');
-    b.title = 'Retry';
+    b.title = tx('Retry', 'ניסיון נוסף');
     b.innerHTML = ICONS.retry;
     b.addEventListener('click', retry);
     box.appendChild(b);
@@ -1141,7 +1263,7 @@ function stationRow(s) {
   star.innerHTML = ICONS.star;
   const on = isFav(s);
   star.classList.toggle('on', on);
-  star.title = on ? 'Remove from favorites' : 'Add to favorites';
+  star.title = on ? tx('Remove from favorites', 'הסרה מהמועדפים') : tx('Add to favorites', 'הוספה למועדפים');
   star.addEventListener('click', (e) => {
     e.stopPropagation();
     toggleFav(s);
@@ -1222,7 +1344,7 @@ function whenPlayed(t) {
 function historyRow(h) {
   const line = [h.artist, h.song].filter(Boolean).join(' - ');
   const b = el('button', 'st-item hist-item');
-  b.title = `${line}\n(click to copy)`;
+  b.title = `${line}\n${COPY_HINT}`;
   const txt = el('span', 'st-text');
   const name = el('span', 'st-name', h.song);
   name.dir = 'auto';
@@ -1231,7 +1353,7 @@ function historyRow(h) {
   txt.append(name, meta);
   const spot = el('span', 'spot-btn');
   spot.innerHTML = ICONS.spotify;
-  spot.title = 'Open in Spotify';
+  spot.title = tx('Open in Spotify', 'פתיחה ב-Spotify');
   spot.addEventListener('click', (e) => {
     e.stopPropagation();
     openSpotify(h.artist, h.song);
@@ -1298,7 +1420,7 @@ for (const n of [$('.titlebar'), $('#compact')]) {
 $('#btnPlayBig').addEventListener('click', togglePlay);
 $('#btnPlaySmall').addEventListener('click', togglePlay);
 $('#btnShuffle').addEventListener('click', () => {
-  autoSkips = 0;
+  resetRecovery();
   playRandom();
 });
 $('#btnClose').addEventListener('click', () => window.radio.hide()); // keeps playing; quit from the tray
@@ -1358,6 +1480,11 @@ window.radio.onSettings((patch) => {
   Object.assign(state.settings, rest);
   syncToggles(autoStart);
   if (['adDuck', 'adLevel', 'callDuck', 'callLevel'].some((k) => k in rest)) duckChanged();
+  if ('muted' in rest) {
+    state.muted = !!rest.muted; // from the tray menu
+    syncVolumeUI();
+    applyVolume();
+  }
   // from the settings window
   if ('countries' in rest && state.dropdown === 'country') loadCountries();
   if ('country' in rest) {
@@ -1368,12 +1495,20 @@ window.radio.onSettings((patch) => {
 });
 window.radio.onTogglePlay(togglePlay);
 
+// Called on every repaint of the song line, so only real changes go to the
+// backend (each one rebuilds the tray menu).
+let reported = '';
 function reportNowPlaying() {
-  window.radio.nowPlaying({
+  const np = {
     station: state.station ? state.station.name : '',
     title: [state.artist, state.song].filter(Boolean).join(' — '),
     playing: state.playing,
-  });
+  };
+  const key = JSON.stringify(np);
+  if (key !== reported) {
+    reported = key;
+    window.radio.nowPlaying(np);
+  }
   updateMediaSession();
 }
 
@@ -1429,13 +1564,15 @@ window.radio.onOcclusion((p) => {
 });
 // a new version is announced by the backend (Windows toast + dot on the tray icon)
 // and shown in the settings window
-window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — נסה שוב מתפריט המגש' : 'The update failed — try again from the tray menu'));
+window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — אפשר להוריד אותו מדף ההורדות' : 'The update failed — you can get it from the download page'));
 
 // ---------- boot ----------
 (async function boot() {
   const init = await window.radio.init();
   state.settings = init.settings;
   state.proxyPort = init.proxyPort;
+  state.proxyKey = init.proxyKey || '';
+  state.muted = !!state.settings.muted;
   // history saved before iHeart titles were parsed
   for (const h of history()) {
     if (/\btext="/.test(h.song)) h.song = parseTitle(`- ${h.song}`).title;
@@ -1446,6 +1583,13 @@ window.radio.onUpdateFailed(() => toast(HE ? 'העדכון נכשל — נסה �
   window.radio.updateState().then(onUpdateInfo);
   setStation(state.settings.station, false);
   setPlayUI('paused');
+  if (init.autostarted) {
+    // started with Windows: open small and out of the way, then appear
+    try {
+      await setMode(state.settings.stayOnTop ? 'logo' : 'compact');
+    } catch {}
+    window.radio.showReady();
+  }
   requestAnimationFrame(frame);
   bumpIdle();
   // warm the station list in the background so the dropdown opens instantly

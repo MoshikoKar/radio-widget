@@ -10,6 +10,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetParent, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, IsIconic,
     IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -103,6 +104,12 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return BOOL(0); // stop: later windows are below us
     }
     if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return BOOL(1);
+    }
+    // "visible" but not drawn: windows on another virtual desktop, suspended store apps
+    let mut cloaked = 0u32;
+    let asked = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, std::ptr::from_mut(&mut cloaked).cast(), 4);
+    if asked.is_ok() && cloaked != 0 {
         return BOOL(1);
     }
     if GetParent(hwnd).is_ok() {

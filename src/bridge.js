@@ -48,6 +48,8 @@
     onSettings: (cb) => listen('settings-changed', (e) => cb(e.payload)),
     onWake: (cb) => listen('wake', () => cb()),
     openSettings: () => invoke('open_settings'),
+    // after a start with Windows the window stays hidden until the UI is in its mode
+    showReady: () => invoke('show_ready'),
     // settings window → backend: saves, refreshes the tray, tells the widget
     setSettings: (patch) => invoke('set_settings', { patch }),
     updateState: () => invoke('update_state'),

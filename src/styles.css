@@ -494,6 +494,9 @@ body.settings-win { background: rgb(19, 21, 29); height: 100vh; }
 .seg button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .seg button[aria-pressed='true'] { background: rgba(91, 140, 255, 0.18); border-color: rgba(91, 140, 255, 0.55); color: var(--text); }
 .seg button:disabled { opacity: 0.4; cursor: default; }
+.seg.wide { flex-wrap: wrap; }
+.seg.wide button { width: auto; padding: 0 10px; }
+.set-hint.bad { color: #ff8a8a; }
 
 .upd-ver { font-size: 15px; font-weight: 650; }
 .upd-status { font-size: 13px; color: var(--muted); }

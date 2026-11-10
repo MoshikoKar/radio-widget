@@ -13,12 +13,13 @@ mod updater;
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, RunEvent, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -41,7 +42,7 @@ struct Rect {
     h: i32,
 }
 
-#[derive(Default, Deserialize, Clone)]
+#[derive(Default, Deserialize, Clone, PartialEq)]
 struct NowPlaying {
     station: String,
     title: String,
@@ -57,8 +58,42 @@ struct Inner {
     proxy_port: u16,
     now_playing: NowPlaying,
     hotkey: Option<&'static str>,
-    save_gen: u64,
-    logo_gen: u64,
+    /// started by Windows at sign-in (`--autostart`): opens collapsed, without focus
+    autostarted: bool,
+}
+
+// ---------- language / region ----------
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetUserDefaultUILanguage() -> u16;
+    fn GetUserDefaultGeoName(geo_name: *mut u16, count: i32) -> i32;
+}
+
+/// Windows is set to Hebrew (the UI's own texts follow `navigator.language`,
+/// which WebView2 takes from the same setting).
+pub(crate) fn hebrew() -> bool {
+    static HE: OnceLock<bool> = OnceLock::new();
+    *HE.get_or_init(|| unsafe { GetUserDefaultUILanguage() } & 0x3ff == 0x0d)
+}
+
+/// The English or the Hebrew text, by the Windows display language.
+pub(crate) fn tr(en: &'static str, he: &'static str) -> &'static str {
+    if hebrew() {
+        he
+    } else {
+        en
+    }
+}
+
+/// The user's country in Windows' region settings, as an ISO 3166-1 code.
+fn system_region() -> Option<String> {
+    let mut buf = [0u16; 16];
+    let n = unsafe { GetUserDefaultGeoName(buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 1 {
+        return None;
+    }
+    let s = String::from_utf16_lossy(&buf[..(n - 1) as usize]).to_ascii_uppercase();
+    (s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase())).then_some(s)
 }
 
 /// Last position we set ourselves, so Moved events we caused aren't
@@ -74,6 +109,8 @@ fn defaults() -> Map<String, Value> {
         "countries": ["IL", "US", "GB", "CA", "AU", "IE", "NZ", "ZA"],
         "station": null,
         "volume": 0.7,
+        "muted": false,
+        "hotkey": "auto",
         "stayOnTop": false,
         "logoOpenOn": "hover",
         "logoPos": null,
@@ -98,35 +135,93 @@ fn settings_path(app: &AppHandle) -> PathBuf {
         .join("settings.json")
 }
 
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+/// A settings file, if it's there and holds a JSON object.
+fn read_settings_file(path: &Path) -> Option<Map<String, Value>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&text).ok()? {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }
+}
+
 fn load_settings(app: &AppHandle) -> Map<String, Value> {
     let mut s = defaults();
     let path = settings_path(app);
-    let mut text = std::fs::read_to_string(&path).ok();
-    if text.is_none() {
-        // import settings from the earlier prototype, if present
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            text = std::fs::read_to_string(PathBuf::from(appdata).join("radio-widget").join("settings.json")).ok();
+    let saved = read_settings_file(&path)
+        // a damaged file (crash or power cut mid-write): the copy from the save before
+        .or_else(|| read_settings_file(&backup_path(&path)))
+        // settings from the earlier prototype, if present
+        .or_else(|| {
+            let appdata = std::env::var("APPDATA").ok()?;
+            read_settings_file(&PathBuf::from(appdata).join("radio-widget").join("settings.json"))
+        });
+    match saved {
+        Some(saved) => {
+            for (k, v) in saved {
+                s.insert(k, v);
+            }
         }
-    }
-    if let Some(Value::Object(saved)) = text.and_then(|t| serde_json::from_str(&t).ok()) {
-        for (k, v) in saved {
-            s.insert(k, v);
-        }
+        None => first_run_country(&mut s, system_region()),
     }
     s
 }
 
+/// First run: start in the user's own country (Windows region), listed first.
+fn first_run_country(s: &mut Map<String, Value>, region: Option<String>) {
+    let Some(cc) = region.filter(|cc| cc != "IL") else { return };
+    let mut list = vec![cc.clone()];
+    for c in ["US", "GB", "CA", "AU", "IE", "NZ", "ZA"] {
+        if c != cc {
+            list.push(c.to_string());
+        }
+    }
+    s.insert("country".into(), json!(cc));
+    s.insert("countries".into(), json!(list));
+}
+
+/// Writes to a temporary file and renames it over the settings, so a crash or
+/// power cut mid-write can't leave a half-written file. The settings as they
+/// were before stay next to it as `settings.json.bak`.
 fn write_settings(app: &AppHandle, s: &Map<String, Value>) {
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(text) = serde_json::to_string_pretty(s) else { return };
     let path = settings_path(app);
+    write_settings_file(&path, &text);
+}
+
+fn write_settings_file(path: &Path, text: &str) {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, serde_json::to_string_pretty(s).unwrap_or_default());
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // only a readable file becomes the backup: a damaged one must not replace a good copy
+    if read_settings_file(path).is_some() {
+        let _ = std::fs::copy(path, backup_path(path));
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
-/// Writes the settings right away (before the app is closed for an update).
+/// Writes the settings right away (on quit, and before the app is closed for an update).
 fn save_settings_now(app: &AppHandle) {
-    let snapshot = app.state::<Shared>().lock().unwrap().settings.clone();
+    let Some(st) = app.try_state::<Shared>() else { return };
+    let snapshot = st.lock().unwrap().settings.clone();
     write_settings(app, &snapshot);
 }
 
@@ -146,23 +241,51 @@ fn prepare_for_update_exit(app: &AppHandle) {
     app.cleanup_before_exit();
 }
 
-/// Debounced save (drags fire many move events).
-fn schedule_save(app: &AppHandle, inner: &mut Inner) {
-    inner.save_gen += 1;
-    let gen = inner.save_gen;
-    let app = app.clone();
+static SAVE_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+static LOGO_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+/// One background thread per job, woken through a channel, that runs `job`
+/// once the requests have been quiet for `quiet` (drags fire many move events).
+fn debounced(quiet: Duration, job: impl Fn() + Send + 'static) -> mpsc::Sender<()> {
+    let (tx, rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        let st = app.state::<Shared>();
-        let snapshot = {
-            let g = st.lock().unwrap();
-            if g.save_gen != gen {
-                return;
-            }
-            g.settings.clone()
-        };
-        write_settings(&app, &snapshot);
+        while rx.recv().is_ok() {
+            while rx.recv_timeout(quiet).is_ok() {}
+            job();
+        }
     });
+    tx
+}
+
+fn start_workers(app: &AppHandle) {
+    let a = app.clone();
+    let _ = SAVE_TX.set(debounced(Duration::from_millis(300), move || save_settings_now(&a)));
+    let a = app.clone();
+    let _ = LOGO_TX.set(debounced(Duration::from_millis(400), move || settle_logo(&a)));
+}
+
+/// Debounced save.
+fn schedule_save(_app: &AppHandle, _inner: &mut Inner) {
+    if let Some(tx) = SAVE_TX.get() {
+        let _ = tx.send(());
+    }
+}
+
+/// Once a drag of the logo settles, pull it back on-screen if needed.
+fn settle_logo(app: &AppHandle) {
+    let Some(win) = main_window(app) else { return };
+    let st = app.state::<Shared>();
+    if st.lock().unwrap().mode != "logo" {
+        return;
+    }
+    let b = bounds(&win);
+    let r = clamp(&win, b);
+    if r != b {
+        set_bounds(&win, r);
+    }
+    let mut g = st.lock().unwrap();
+    g.settings.insert("logoPos".into(), json!({ "x": r.x, "y": r.y }));
+    schedule_save(app, &mut g);
 }
 
 fn stay_on_top(inner: &Inner) -> bool {
@@ -396,6 +519,7 @@ fn hide_widget(app: &AppHandle, win: &WebviewWindow) {
 
 fn show_widget(app: &AppHandle) {
     if let Some(win) = main_window(app) {
+        SHOWN.store(true, Ordering::SeqCst);
         set_webview_hidden(&win, false);
         let _ = win.show();
         let _ = win.emit("wake", ());
@@ -445,6 +569,35 @@ fn auto_start(app: &AppHandle) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
+/// The "Start with Windows" entry starts this very exe, but without
+/// `--autostart` (it was made by a version before 0.5.16). An entry for another
+/// copy of the app (portable next to installed) is left alone.
+fn autostart_lacks_arg(app: &AppHandle) -> bool {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let name = HSTRING::from(app.package_info().name.as_str());
+    let mut buf = [0u16; 1024];
+    let mut bytes = (buf.len() * 2) as u32;
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            &name,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if read.is_err() {
+        return false;
+    }
+    let len = (bytes as usize / 2).min(buf.len());
+    let entry = String::from_utf16_lossy(&buf[..len]).trim_end_matches(char::from(0u8)).to_lowercase();
+    let Ok(me) = std::env::current_exe() else { return false };
+    entry.contains(&me.to_string_lossy().to_lowercase()) && !entry.contains(AUTOSTART_ARG)
+}
+
 fn set_auto_start(app: &AppHandle, on: bool) -> bool {
     let al = app.autolaunch();
     let _ = if on { al.enable() } else { al.disable() };
@@ -453,7 +606,7 @@ fn set_auto_start(app: &AppHandle, on: bool) -> bool {
 
 fn update_tray(app: &AppHandle) {
     let Some(tray) = app.tray_by_id("main") else { return };
-    let (np, on_top, hotkey, ad_duck, ad_level, call_duck, call_level) = {
+    let (np, on_top, hotkey, muted, ad_duck, ad_level, call_duck, call_level) = {
         let st = app.state::<Shared>();
         let g = st.lock().unwrap();
         let flag = |k: &str| g.settings.get(k).and_then(Value::as_bool).unwrap_or(true);
@@ -462,6 +615,7 @@ fn update_tray(app: &AppHandle) {
             g.now_playing.clone(),
             stay_on_top(&g),
             g.hotkey,
+            g.settings.get("muted").and_then(Value::as_bool).unwrap_or(false),
             flag("adDuck"),
             level("adLevel"),
             flag("callDuck"),
@@ -478,22 +632,25 @@ fn update_tray(app: &AppHandle) {
 
     let visible = main_window(app).and_then(|w| w.is_visible().ok()).unwrap_or(false);
     let build = || -> tauri::Result<Menu<tauri::Wry>> {
-        let play = MenuItem::with_id(app, "toggle-play", if np.playing { "Pause" } else { "Play" }, true, None::<&str>)?;
-        let show = MenuItem::with_id(app, "showhide", if visible { "Hide widget" } else { "Show widget" }, true, hotkey)?;
-        let top = CheckMenuItem::with_id(app, "stayontop", "Stay on top", true, on_top, None::<&str>)?;
-        let auto = CheckMenuItem::with_id(app, "autostart", "Start with Windows", true, auto_start(app), None::<&str>)?;
-        let duck = CheckMenuItem::with_id(app, "adduck", "Lower volume during ads", true, ad_duck, None::<&str>)?;
-        let level = level_menu(app, "adlevel", "Ad volume", ad_duck, ad_level)?;
-        let cduck = CheckMenuItem::with_id(app, "callduck", "Lower volume during calls", true, call_duck, None::<&str>)?;
-        let clevel = level_menu(app, "calllevel", "Call volume", call_duck, call_level)?;
-        let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+        let play = MenuItem::with_id(app, "toggle-play", if np.playing { tr("Pause", "השהיה") } else { tr("Play", "נגינה") }, true, None::<&str>)?;
+        let mute = CheckMenuItem::with_id(app, "mute", tr("Mute", "השתקה"), true, muted, None::<&str>)?;
+        let show_text = if visible { tr("Hide widget", "הסתרת הווידג׳ט") } else { tr("Show widget", "הצגת הווידג׳ט") };
+        let show = MenuItem::with_id(app, "showhide", show_text, true, hotkey)?;
+        let top = CheckMenuItem::with_id(app, "stayontop", tr("Stay on top", "תמיד מעל"), true, on_top, None::<&str>)?;
+        let auto = CheckMenuItem::with_id(app, "autostart", tr("Start with Windows", "הפעלה עם Windows"), true, auto_start(app), None::<&str>)?;
+        let duck = CheckMenuItem::with_id(app, "adduck", tr("Lower volume during ads", "להנמיך בזמן פרסומות"), true, ad_duck, None::<&str>)?;
+        let level = level_menu(app, "adlevel", tr("Ad volume", "ווליום בפרסומות"), ad_duck, ad_level)?;
+        let cduck = CheckMenuItem::with_id(app, "callduck", tr("Lower volume during calls", "להנמיך בזמן שיחות"), true, call_duck, None::<&str>)?;
+        let clevel = level_menu(app, "calllevel", tr("Call volume", "ווליום בשיחות"), call_duck, call_level)?;
+        let settings = MenuItem::with_id(app, "settings", tr("Settings…", "הגדרות…"), true, None::<&str>)?;
         let (update_text, update_on) = updater::label(app);
         let update = MenuItem::with_id(app, "update", update_text, update_on, None::<&str>)?;
-        let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", tr("Quit", "יציאה"), true, None::<&str>)?;
         Menu::with_items(
             app,
             &[
                 &play,
+                &mute,
                 &show,
                 &PredefinedMenuItem::separator(app)?,
                 &top,
@@ -524,7 +681,8 @@ fn level_menu(app: &AppHandle, prefix: &str, title: &str, enabled: bool, cur: f6
         .iter()
         .map(|&p| {
             let on = (cur * 100.0 - p as f64).abs() < 1.0;
-            CheckMenuItem::with_id(app, format!("{prefix}-{p}"), format!("{p}% of current volume"), enabled, on, None::<&str>)
+            let text = format!("{p}% {}", tr("of current volume", "מהווליום הנוכחי"));
+            CheckMenuItem::with_id(app, format!("{prefix}-{p}"), text, enabled, on, None::<&str>)
         })
         .collect::<tauri::Result<Vec<_>>>()?;
     let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = items.iter().map(|m| m as _).collect();
@@ -590,6 +748,10 @@ fn on_menu(app: &AppHandle, id: &str) {
             let cur = app.state::<Shared>().lock().unwrap().settings.get(key).and_then(Value::as_bool).unwrap_or(true);
             set_setting(app, key, json!(!cur));
         }
+        "mute" => {
+            let cur = app.state::<Shared>().lock().unwrap().settings.get("muted").and_then(Value::as_bool).unwrap_or(false);
+            set_setting(app, "muted", json!(!cur));
+        }
         "quit" => app.exit(0),
         "update" => updater::on_click(app),
         "settings" => open_settings_window(app),
@@ -616,32 +778,12 @@ fn on_moved(app: &AppHandle, win: &WebviewWindow, x: i32, y: i32) {
     let Ok(mut g) = st.try_lock() else { return };
     if g.mode == "logo" {
         g.settings.insert("logoPos".into(), json!({ "x": x, "y": y }));
-        // once the drag settles, pull the logo back on-screen if needed
-        g.logo_gen += 1;
-        let gen = g.logo_gen;
         schedule_save(app, &mut g);
         drop(g);
-        let app = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            let Some(win) = main_window(&app) else { return };
-            {
-                let st = app.state::<Shared>();
-                let g = st.lock().unwrap();
-                if g.logo_gen != gen || g.mode != "logo" {
-                    return;
-                }
-            }
-            let b = bounds(&win);
-            let r = clamp(&win, b);
-            if r != b {
-                set_bounds(&win, r);
-            }
-            let st = app.state::<Shared>();
-            let mut g = st.lock().unwrap();
-            g.settings.insert("logoPos".into(), json!({ "x": r.x, "y": r.y }));
-            schedule_save(&app, &mut g);
-        });
+        // once the drag settles, pull the logo back on-screen if needed
+        if let Some(tx) = LOGO_TX.get() {
+            let _ = tx.send(());
+        }
     } else if g.pre_dropdown.is_none() {
         g.temp_from_logo = false;
         remember_pos(win, &mut g);
@@ -653,7 +795,73 @@ fn on_moved(app: &AppHandle, win: &WebviewWindow, x: i32, y: i32) {
 #[tauri::command]
 fn init(app: AppHandle, state: State<Shared>) -> Value {
     let g = state.lock().unwrap();
-    json!({ "settings": g.settings, "autoStart": auto_start(&app), "proxyPort": g.proxy_port })
+    json!({
+        "settings": g.settings,
+        "autoStart": auto_start(&app),
+        "proxyPort": g.proxy_port,
+        "proxyKey": proxy::key(),
+        "autostarted": g.autostarted,
+        "hotkey": g.hotkey,
+    })
+}
+
+static SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// First show after a start with Windows: on screen, but without taking the
+/// focus from whatever the user is doing.
+fn show_quietly(app: &AppHandle) {
+    if SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(win) = main_window(app) {
+        match win.hwnd() {
+            // not ShowWindow: its first call in a process may ignore "no activate"
+            Ok(hwnd) => unsafe {
+                const SHOW_IN_PLACE: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0040; // NOSIZE NOMOVE NOZORDER NOACTIVATE SHOWWINDOW
+                SetWindowPos(hwnd.0 as isize, 0, 0, 0, 0, 0, SHOW_IN_PLACE);
+            },
+            Err(_) => {
+                let _ = win.show();
+            }
+        }
+    }
+    update_tray(app);
+}
+
+/// The UI is in its starting mode (autostart only): the window can appear.
+#[tauri::command]
+fn show_ready(app: AppHandle) {
+    show_quietly(&app);
+}
+
+// ---------- global hotkey ----------
+const HOTKEYS: [(&str, &str, Modifiers); 2] = [
+    ("ctrl+alt+r", "Ctrl+Alt+R", Modifiers::CONTROL.union(Modifiers::ALT)),
+    ("ctrl+shift+alt+r", "Ctrl+Shift+Alt+R", Modifiers::CONTROL.union(Modifiers::ALT).union(Modifiers::SHIFT)),
+];
+
+/// Registers the hotkey the settings ask for: "auto" (the first one that's
+/// free), one of `HOTKEYS`, or "off". Returns the one now active.
+fn apply_hotkey(app: &AppHandle) -> Option<&'static str> {
+    let want = {
+        let st = app.state::<Shared>();
+        let g = st.lock().unwrap();
+        g.settings.get("hotkey").and_then(Value::as_str).unwrap_or("auto").to_string()
+    };
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+    let mut active = None;
+    for (id, label, mods) in HOTKEYS {
+        if want != "auto" && want != id {
+            continue;
+        }
+        if gs.register(Shortcut::new(Some(mods), Code::KeyR)).is_ok() {
+            active = Some(label);
+            break;
+        }
+    }
+    app.state::<Shared>().lock().unwrap().hotkey = active;
+    active
 }
 
 #[tauri::command]
@@ -692,7 +900,7 @@ fn set_auto_start_cmd(app: AppHandle, on: bool) -> bool {
 #[tauri::command]
 fn save(app: AppHandle, state: State<Shared>, patch: Map<String, Value>) {
     // the tray menu shows these too
-    let tray = ["adDuck", "adLevel", "callDuck", "callLevel"].iter().any(|k| patch.contains_key(*k));
+    let tray = ["adDuck", "adLevel", "callDuck", "callLevel", "muted"].iter().any(|k| patch.contains_key(*k));
     {
         let mut g = state.lock().unwrap();
         for (k, v) in patch {
@@ -708,7 +916,7 @@ fn save(app: AppHandle, state: State<Shared>, patch: Map<String, Value>) {
 /// Several settings at once, from the settings window: saved, shown in the
 /// tray menu, and sent to the widget.
 #[tauri::command]
-fn set_settings(app: AppHandle, patch: Map<String, Value>) {
+fn set_settings(app: AppHandle, patch: Map<String, Value>) -> Value {
     {
         let st = app.state::<Shared>();
         let mut g = st.lock().unwrap();
@@ -717,8 +925,14 @@ fn set_settings(app: AppHandle, patch: Map<String, Value>) {
         }
         schedule_save(&app, &mut g);
     }
+    let hotkey = if patch.contains_key("hotkey") {
+        apply_hotkey(&app)
+    } else {
+        app.state::<Shared>().lock().unwrap().hotkey
+    };
     let _ = app.emit("settings-changed", Value::Object(patch));
     update_tray(&app);
+    json!({ "hotkey": hotkey })
 }
 
 /// The settings window: made when asked for and destroyed when closed, so it
@@ -765,27 +979,72 @@ fn update_click(app: AppHandle) {
 }
 
 const API_HOSTS: [&str; 3] = ["de1.api.radio-browser.info", "fi1.api.radio-browser.info", "de2.api.radio-browser.info"];
+const API_DOMAIN: &str = ".api.radio-browser.info";
+/// Servers the directory itself listed, asked for once the built-in ones all failed.
+static FOUND_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn api_get(host: &str, q: &str) -> Result<Value, String> {
+    let url = format!("https://{host}/json/{q}");
+    // the directory's certificates are checked (stream hosts' aren't: see http.rs)
+    let mut r = http::get(&url, &[], Duration::from_secs(8), true).map_err(|e| e.to_string())?;
+    if r.status != 200 {
+        return Err(format!("HTTP {}", r.status));
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut r.body, &mut text).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// The directory's current servers, from its round-robin name. Only names
+/// under its own domain count, since this list arrives unencrypted.
+fn find_api_hosts() -> Vec<String> {
+    let Ok(mut r) = http::get("http://all.api.radio-browser.info/json/servers", &[], Duration::from_secs(8), true) else {
+        return Vec::new();
+    };
+    let mut text = String::new();
+    if r.status != 200 || std::io::Read::read_to_string(&mut r.body, &mut text).is_err() {
+        return Vec::new();
+    }
+    let rows: Vec<Value> = serde_json::from_str(&text).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for row in rows {
+        let Some(name) = row.get("name").and_then(Value::as_str) else { continue };
+        let name = name.to_ascii_lowercase();
+        let ok = name.ends_with(API_DOMAIN)
+            && name.len() > API_DOMAIN.len()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if ok && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
 
 #[tauri::command]
 async fn api(q: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut last = String::from("no hosts");
-        for host in API_HOSTS {
-            let url = format!("https://{host}/json/{q}");
-            match http::get(&url, &[], Duration::from_secs(8)) {
-                Ok(mut r) if r.status == 200 => {
-                    let mut text = String::new();
-                    if let Err(e) = std::io::Read::read_to_string(&mut r.body, &mut text) {
-                        last = e.to_string();
-                        continue;
-                    }
-                    match serde_json::from_str(&text) {
-                        Ok(v) => return Ok(v),
-                        Err(e) => last = e.to_string(),
-                    }
-                }
-                Ok(r) => last = format!("HTTP {}", r.status),
-                Err(e) => last = e.to_string(),
+        let mut tried: Vec<String> = Vec::new();
+        let found = FOUND_HOSTS.lock().unwrap().clone();
+        for host in found.iter().map(String::as_str).chain(API_HOSTS) {
+            if tried.iter().any(|t| t == host) {
+                continue;
+            }
+            tried.push(host.to_string());
+            match api_get(host, &q) {
+                Ok(v) => return Ok(v),
+                Err(e) => last = e,
+            }
+        }
+        // none of the known servers answered: ask the directory which ones exist now
+        let fresh = find_api_hosts();
+        if !fresh.is_empty() {
+            *FOUND_HOSTS.lock().unwrap() = fresh.clone();
+        }
+        for host in fresh.iter().filter(|h| !tried.contains(h)) {
+            match api_get(host, &q) {
+                Ok(v) => return Ok(v),
+                Err(e) => last = e,
             }
         }
         Err(last)
@@ -811,10 +1070,10 @@ fn logo_menu(app: AppHandle, state: State<Shared>) {
         Menu::with_items(
             &app,
             &[
-                &CheckMenuItem::with_id(&app, "open-hover", "Open on hover", true, hover, None::<&str>)?,
-                &CheckMenuItem::with_id(&app, "open-click", "Open on click", true, !hover, None::<&str>)?,
+                &CheckMenuItem::with_id(&app, "open-hover", tr("Open on hover", "פתיחה במעבר עכבר"), true, hover, None::<&str>)?,
+                &CheckMenuItem::with_id(&app, "open-click", tr("Open on click", "פתיחה בלחיצה"), true, !hover, None::<&str>)?,
                 &PredefinedMenuItem::separator(&app)?,
-                &MenuItem::with_id(&app, "quit", "Quit", true, None::<&str>)?,
+                &MenuItem::with_id(&app, "quit", tr("Quit", "יציאה"), true, None::<&str>)?,
             ],
         )
     };
@@ -881,7 +1140,13 @@ fn spotify_target(query: &str) -> Option<String> {
 
 #[tauri::command]
 fn now_playing(app: AppHandle, state: State<Shared>, np: NowPlaying) {
-    state.lock().unwrap().now_playing = np;
+    {
+        let mut g = state.lock().unwrap();
+        if g.now_playing == np {
+            return; // nothing new for the tray
+        }
+        g.now_playing = np;
+    }
     update_tray(&app);
 }
 
@@ -901,16 +1166,18 @@ fn initial_rect(win: &WebviewWindow, settings: &Map<String, Value>) -> Rect {
     clamp(win, Rect { x: right - w, y: bottom - h, w, h })
 }
 
-const HOTKEYS: [(&str, Modifiers); 2] = [
-    ("Ctrl+Alt+R", Modifiers::CONTROL.union(Modifiers::ALT)),
-    ("Ctrl+Shift+Alt+R", Modifiers::CONTROL.union(Modifiers::ALT).union(Modifiers::SHIFT)),
-];
+/// Passed by the "Start with Windows" entry, so a start at sign-in can be told
+/// from the user opening the app.
+const AUTOSTART_ARG: &str = "--autostart";
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_widget(app)))
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARG]),
+        ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _sc, ev| {
@@ -937,7 +1204,8 @@ fn main() {
             update_state,
             update_click,
             set_settings,
-            open_settings
+            open_settings,
+            show_ready
         ])
         .on_menu_event(|app, ev| on_menu(app, ev.id().as_ref()))
         .on_window_event(|window, event| {
@@ -965,6 +1233,12 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             let settings = load_settings(&handle);
+            let autostarted = std::env::args().any(|a| a == AUTOSTART_ARG);
+            // "Start with Windows" entries made before 0.5.16 lack the argument
+            if autostart_lacks_arg(&handle) {
+                let _ = handle.autolaunch().enable();
+            }
+            start_workers(&handle);
             let port = proxy::start(handle.clone());
             calls::start(handle.clone());
             let on_top = settings.get("stayOnTop").and_then(Value::as_bool).unwrap_or(false);
@@ -980,20 +1254,30 @@ fn main() {
                 proxy_port: port,
                 now_playing: NowPlaying::default(),
                 hotkey: None,
-                save_gen: 0,
-                logo_gen: 0,
+                autostarted,
             }));
             set_bounds(&win, rect);
             let _ = win.set_always_on_top(on_top);
-            let _ = win.show();
-            let _ = win.set_focus();
-
-            for (label, mods) in HOTKEYS {
-                if app.global_shortcut().register(Shortcut::new(Some(mods), Code::KeyR)).is_ok() {
-                    app.state::<Shared>().lock().unwrap().hotkey = Some(label);
-                    break;
-                }
+            if autostarted {
+                // the UI collapses itself first and then calls `show_ready`;
+                // if that never comes, show the window anyway
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(5));
+                    show_quietly(&h);
+                });
+            } else {
+                SHOWN.store(true, Ordering::SeqCst);
+                let _ = win.show();
+                let _ = win.set_focus();
             }
+            {
+                // writes the settings file on a first run
+                let st = app.state::<Shared>();
+                schedule_save(&handle, &mut st.lock().unwrap());
+            }
+
+            apply_hotkey(&handle);
 
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().cloned().expect("icon"))
@@ -1016,6 +1300,63 @@ fn main() {
             update_tray(&handle);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Radio Widget");
+        .build(tauri::generate_context!())
+        .expect("error while running Radio Widget")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                // a change made a moment ago may still be waiting for the debounced save
+                save_settings_now(app);
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("radio-widget-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn settings_survive_a_damaged_file() {
+        let dir = temp_dir("settings");
+        let path = dir.join("settings.json");
+        write_settings_file(&path, r#"{"volume":0.1}"#);
+        write_settings_file(&path, r#"{"volume":0.2}"#);
+        assert_eq!(read_settings_file(&path).unwrap()["volume"], json!(0.2));
+        assert_eq!(read_settings_file(&backup_path(&path)).unwrap()["volume"], json!(0.1));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        // a half-written file is unreadable, and must not replace the good backup
+        std::fs::write(&path, r#"{"volume":0."#).unwrap();
+        assert!(read_settings_file(&path).is_none());
+        write_settings_file(&path, r#"{"volume":0.3}"#);
+        assert_eq!(read_settings_file(&backup_path(&path)).unwrap()["volume"], json!(0.1));
+        assert_eq!(read_settings_file(&path).unwrap()["volume"], json!(0.3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_run_starts_in_the_users_country() {
+        let mut s = defaults();
+        first_run_country(&mut s, Some("DE".into()));
+        assert_eq!(s["country"], json!("DE"));
+        assert_eq!(s["countries"], json!(["DE", "US", "GB", "CA", "AU", "IE", "NZ", "ZA"]));
+
+        let mut s = defaults();
+        first_run_country(&mut s, Some("GB".into()));
+        assert_eq!(s["countries"], json!(["GB", "US", "CA", "AU", "IE", "NZ", "ZA"]));
+
+        // Israel and an unknown region keep the built-in list
+        for region in [Some("IL".to_string()), None] {
+            let mut s = defaults();
+            first_run_country(&mut s, region);
+            assert_eq!(s["country"], json!("IL"));
+            assert_eq!(s["countries"].as_array().unwrap().len(), 8);
+        }
+    }
 }

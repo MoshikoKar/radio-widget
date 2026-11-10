@@ -31,7 +31,7 @@ fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg.into())
 }
 
-fn connect(url: &Url, timeout: Duration) -> io::Result<Box<dyn Stream>> {
+fn connect(url: &Url, timeout: Duration, verify_tls: bool) -> io::Result<Box<dyn Stream>> {
     let host = url.host_str().ok_or_else(|| err("no host"))?;
     let port = url.port_or_known_default().ok_or_else(|| err("no port"))?;
     let mut last = err("could not resolve host");
@@ -42,10 +42,9 @@ fn connect(url: &Url, timeout: Duration) -> io::Result<Box<dyn Stream>> {
                 tcp.set_write_timeout(Some(timeout))?;
                 tcp.set_nodelay(true).ok();
                 if url.scheme() == "https" {
-                    // radio hosts often have broken or mismatched certificates
                     let tls = native_tls::TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .danger_accept_invalid_hostnames(true)
+                        .danger_accept_invalid_certs(!verify_tls)
+                        .danger_accept_invalid_hostnames(!verify_tls)
                         .build()
                         .map_err(|e| err(e.to_string()))?;
                     let s = tls.connect(host, tcp).map_err(|e| err(e.to_string()))?;
@@ -60,13 +59,15 @@ fn connect(url: &Url, timeout: Duration) -> io::Result<Box<dyn Stream>> {
 }
 
 /// GET `url`, following up to 5 redirects. `extra` headers are sent as-is.
-pub fn get(url: &str, extra: &[(&str, &str)], timeout: Duration) -> io::Result<Response> {
+/// `verify_tls` checks the server's certificate: on for the station directory,
+/// off for streams, whose hosts often have broken or mismatched certificates.
+pub fn get(url: &str, extra: &[(&str, &str)], timeout: Duration, verify_tls: bool) -> io::Result<Response> {
     let mut url = Url::parse(url).map_err(|e| err(e.to_string()))?;
     for _ in 0..6 {
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(err("unsupported scheme"));
         }
-        let mut stream = connect(&url, timeout)?;
+        let mut stream = connect(&url, timeout, verify_tls)?;
         let host = url.host_str().unwrap_or_default();
         let host_hdr = match url.port() {
             Some(p) => format!("{host}:{p}"),

@@ -11,13 +11,26 @@ use serde::Serialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 static PORT: AtomicU16 = AtomicU16::new(0);
 static LISTENER: Mutex<Option<TcpListener>> = Mutex::new(None);
 static GEN: Mutex<Option<Arc<AtomicU64>>> = Mutex::new(None);
+static KEY: OnceLock<String> = OnceLock::new();
+
+/// A random key, new on every run, that a request must carry (`k=`). Without
+/// it any program on the PC, or a web page that finds the port, could fetch
+/// URLs through the proxy and cut the playing stream.
+pub fn key() -> &'static str {
+    KEY.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        // RandomState is seeded from the system's random source
+        let part = || std::collections::hash_map::RandomState::new().build_hasher().finish();
+        format!("{:016x}{:016x}", part(), part())
+    })
+}
 
 #[derive(Serialize, Clone)]
 struct Meta {
@@ -83,20 +96,25 @@ fn handle(mut client: TcpStream, app: AppHandle, gen: Arc<AtomicU64>) -> std::io
     }
     let target = line.split_whitespace().nth(1).unwrap_or("/");
     let url = url::Url::parse(&format!("http://127.0.0.1{target}")).ok();
-    let (path_ok, id, upstream) = match &url {
+    let (path_ok, key_ok, id, upstream) = match &url {
         Some(u) => {
             let q = |k: &str| u.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
-            (u.path() == "/stream", q("id").unwrap_or_default(), q("u"))
+            (u.path() == "/stream", q("k").as_deref() == Some(key()), q("id").unwrap_or_default(), q("u"))
         }
-        None => (false, String::new(), None),
+        None => (false, false, String::new(), None),
     };
+    if path_ok && !key_ok {
+        client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(());
+    }
     let Some(upstream) = upstream.filter(|_| path_ok) else {
         client.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         return Ok(());
     };
 
     let my_gen = gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let resp = match http::get(&upstream, &[("Icy-MetaData", "1")], Duration::from_secs(10)) {
+    // radio hosts often have broken or mismatched certificates: not checked
+    let resp = match http::get(&upstream, &[("Icy-MetaData", "1")], Duration::from_secs(10), false) {
         Ok(r) if r.status == 200 => r,
         Ok(r) => return bad_gateway(&mut client, &format!("upstream {}", r.status)),
         Err(e) => return bad_gateway(&mut client, &e.to_string()),

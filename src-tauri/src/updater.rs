@@ -11,7 +11,7 @@
 //! opens the release page instead.
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use tauri::image::Image;
@@ -19,9 +19,14 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::toast::{self, ToastActions};
+use crate::tr;
 
 const FIRST_CHECK: Duration = Duration::from_secs(15);
 const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// A background check that failed (no network yet at sign-in, GitHub down) is
+/// tried again after this long, doubling up to `RETRY_MAX`.
+const RETRY_FIRST: Duration = Duration::from_secs(5 * 60);
+const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const RELEASES: &str = "https://github.com/MoshikoKar/radio-widget/releases/latest";
 /// Settings key: the last version the user was asked about (survives restarts).
 const ASKED_KEY: &str = "updateAsked";
@@ -52,21 +57,24 @@ pub fn status(app: &AppHandle) -> Status {
 /// Tray menu label, and whether the item can be clicked.
 pub fn label(app: &AppHandle) -> (String, bool) {
     match status(app) {
-        Status::Idle => ("Check for updates".into(), true),
-        Status::Checking => ("Checking for updates…".into(), false),
-        Status::UpToDate => (format!("Up to date ({}) — check again", app.package_info().version), true),
-        Status::Available(v) if is_portable() => (format!("● Download version {v}…"), true),
-        Status::Available(v) => (format!("● Update now to version {v}"), true),
-        Status::Downloading(p) => (format!("Downloading update… {p}%"), false),
-        Status::Failed => ("Update check failed — try again".into(), true),
+        Status::Idle => (tr("Check for updates", "בדיקת עדכונים").into(), true),
+        Status::Checking => (tr("Checking for updates…", "בודק עדכונים…").into(), false),
+        Status::UpToDate => {
+            let v = app.package_info().version.to_string();
+            (format!("{} ({v}) — {}", tr("Up to date", "הגרסה עדכנית"), tr("check again", "בדיקה חוזרת")), true)
+        }
+        Status::Available(v) if is_portable() => (format!("● {} {v}…", tr("Download version", "הורדת גרסה")), true),
+        Status::Available(v) => (format!("● {} {v}", tr("Update now to version", "עדכון עכשיו לגרסה")), true),
+        Status::Downloading(p) => (format!("{} {p}%", tr("Downloading update…", "מוריד עדכון…")), false),
+        Status::Failed => (tr("Update check failed — try again", "בדיקת העדכון נכשלה — ניסיון נוסף").into(), true),
     }
 }
 
 /// Extra tray tooltip line while an update is offered or downloading.
 pub fn tooltip(app: &AppHandle) -> Option<String> {
     match status(app) {
-        Status::Available(v) => Some(format!("Update available: {v}")),
-        Status::Downloading(p) => Some(format!("Downloading update… {p}%")),
+        Status::Available(v) => Some(format!("{}: {v}", tr("Update available", "עדכון זמין"))),
+        Status::Downloading(p) => Some(format!("{} {p}%", tr("Downloading update…", "מוריד עדכון…"))),
         _ => None,
     }
 }
@@ -122,15 +130,32 @@ pub fn start(app: AppHandle) {
     toast::init();
     tauri::async_runtime::spawn(async move {
         tokio_sleep(FIRST_CHECK).await;
+        let mut retry = RETRY_FIRST;
         loop {
-            run_check(&app, Origin::Auto).await;
-            tokio_sleep(EVERY).await;
+            let wait = if run_check(&app, Origin::Auto).await {
+                retry = RETRY_FIRST;
+                EVERY
+            } else {
+                let wait = retry;
+                retry = (retry * 2).min(RETRY_MAX);
+                wait
+            };
+            sleep_until(SystemTime::now() + wait).await;
         }
     });
 }
 
 async fn tokio_sleep(d: Duration) {
     let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(d)).await;
+}
+
+/// Waits for a time on the clock, looking once a minute. A plain long sleep
+/// doesn't count the hours the PC is asleep, so on a laptop "a day" could
+/// take several.
+async fn sleep_until(at: SystemTime) {
+    while SystemTime::now() < at {
+        tokio_sleep(Duration::from_secs(60)).await;
+    }
 }
 
 fn set(app: &AppHandle, s: Status) {
@@ -153,14 +178,17 @@ fn set(app: &AppHandle, s: Status) {
 }
 
 fn check(app: AppHandle, origin: Origin) {
-    tauri::async_runtime::spawn(async move { run_check(&app, origin).await });
+    tauri::async_runtime::spawn(async move {
+        run_check(&app, origin).await;
+    });
 }
 
-async fn run_check(app: &AppHandle, origin: Origin) {
+/// Returns whether GitHub answered (with or without an update).
+async fn run_check(app: &AppHandle, origin: Origin) -> bool {
     let manual = origin != Origin::Auto;
     let toasts = origin == Origin::Tray;
     if matches!(status(app), Status::Checking | Status::Downloading(_)) {
-        return;
+        return true;
     }
     // a found update stays offered; a background check doesn't flash "Checking…"
     let prev = status(app);
@@ -191,18 +219,23 @@ async fn run_check(app: &AppHandle, origin: Origin) {
             if toasts || (origin == Origin::Auto && new) {
                 notify(app, Ask::Update(v));
             }
+            true
         }
         Ok(None) => {
             set(app, if manual { Status::UpToDate } else { idle_or(prev) });
             if toasts {
                 notify(app, Ask::UpToDate);
             }
+            true
         }
         Err(_) => {
-            set(app, if manual { Status::Failed } else { idle_or(prev) });
+            // a quiet check that couldn't reach GitHub changes nothing on screen:
+            // an update found earlier stays offered
+            set(app, if manual { Status::Failed } else { prev });
             if toasts {
                 notify(app, Ask::Failed);
             }
+            false
         }
     }
 }
@@ -248,6 +281,8 @@ fn install(app: AppHandle) {
             if let Some(w) = crate::main_window(&app) {
                 let _ = w.emit("update-failed", ());
             }
+            // the installer can always be run by hand
+            notify(&app, Ask::InstallFailed);
         }
     });
 }
@@ -302,6 +337,7 @@ enum Ask {
     Update(String),
     UpToDate,
     Failed,
+    InstallFailed,
 }
 
 fn notify(app: &AppHandle, ask: Ask) {
@@ -309,13 +345,17 @@ fn notify(app: &AppHandle, ask: Ask) {
     let cur = app.package_info().version.to_string();
     match ask {
         Ask::Update(v) if is_portable() => {
-            let body = format!("Radio Widget {v} is available (you have {cur}). Open the download page?");
+            let body = if crate::hebrew() {
+                format!("Radio Widget {v} זמין (מותקנת {cur}). לפתוח את דף ההורדה?")
+            } else {
+                format!("Radio Widget {v} is available (you have {cur}). Open the download page?")
+            };
             toast::show(
-                "Update available",
+                tr("Update available", "עדכון זמין"),
                 &body,
                 Some(ToastActions {
-                    primary: ("Open", "update"),
-                    secondary: Some(("Later", "later")),
+                    primary: (tr("Open", "פתיחה"), "update"),
+                    secondary: Some((tr("Later", "אחר כך"), "later")),
                 }),
                 move |args| {
                     if args == "update" || args == "default" {
@@ -325,15 +365,17 @@ fn notify(app: &AppHandle, ask: Ask) {
             );
         }
         Ask::Update(v) => {
-            let body = format!(
-                "Radio Widget {v} is available (you have {cur}). Update now? The widget restarts when it's done."
-            );
+            let body = if crate::hebrew() {
+                format!("Radio Widget {v} זמין (מותקנת {cur}). לעדכן עכשיו? הווידג׳ט יופעל מחדש בסיום.")
+            } else {
+                format!("Radio Widget {v} is available (you have {cur}). Update now? The widget restarts when it's done.")
+            };
             toast::show(
-                "Update available",
+                tr("Update available", "עדכון זמין"),
                 &body,
                 Some(ToastActions {
-                    primary: ("Update", "update"),
-                    secondary: Some(("Later", "later")),
+                    primary: (tr("Update", "עדכון"), "update"),
+                    secondary: Some((tr("Later", "אחר כך"), "later")),
                 }),
                 move |args| {
                     if args == "update" || args == "default" {
@@ -345,17 +387,38 @@ fn notify(app: &AppHandle, ask: Ask) {
         Ask::UpToDate => {
             toast::show(
                 "Radio Widget",
-                &format!("You have the latest version ({cur})."),
+                &format!("{} ({cur}).", tr("You have the latest version", "הגרסה העדכנית מותקנת")),
                 None,
                 |_| {},
             );
         }
+        Ask::InstallFailed => {
+            toast::show(
+                tr("Update failed", "העדכון נכשל"),
+                tr(
+                    "The update couldn't be installed. Download it from the release page and install it by hand?",
+                    "לא ניתן היה להתקין את העדכון. להוריד אותו מדף ההורדות ולהתקין ידנית?",
+                ),
+                Some(ToastActions {
+                    primary: (tr("Open", "פתיחה"), "open"),
+                    secondary: Some((tr("Later", "אחר כך"), "later")),
+                }),
+                |args| {
+                    if args == "open" || args == "default" {
+                        crate::open_url(RELEASES);
+                    }
+                },
+            );
+        }
         Ask::Failed => {
             toast::show(
-                "Update check failed",
-                "Couldn't check for updates. Check your internet connection and try again.",
+                tr("Update check failed", "בדיקת העדכון נכשלה"),
+                tr(
+                    "Couldn't check for updates. Check your internet connection and try again.",
+                    "לא ניתן לבדוק עדכונים. בדוק את החיבור לאינטרנט ונסה שוב.",
+                ),
                 Some(ToastActions {
-                    primary: ("Retry", "retry"),
+                    primary: (tr("Retry", "ניסיון נוסף"), "retry"),
                     secondary: None,
                 }),
                 move |args| {

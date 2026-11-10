@@ -53,6 +53,11 @@ jobs:
         run: |
           $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           if ("v$v" -ne $env:TAG) { throw "Tag $env:TAG doesn't match tauri.conf.json version $v" }
+          # the other places the version is written must agree
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $npm = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($cargo -ne $v) { throw "src-tauri/Cargo.toml says $cargo, tauri.conf.json says $v" }
+          if ($npm -ne $v) { throw "package.json says $npm, tauri.conf.json says $v" }
           "VERSION=$v" >> $env:GITHUB_ENV
 
       - uses: actions/setup-node@v4

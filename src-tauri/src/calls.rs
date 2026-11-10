@@ -40,8 +40,21 @@ pub fn start(app: AppHandle) {
         let (mut on_for, mut off_for) = (0u32, 0u32);
         let mut active = false;
         let mut last_apps: Vec<String> = Vec::new();
+        // made once and kept: creating it every second is the costly part
+        let mut devices: Option<IMMDeviceEnumerator> = None;
         loop {
-            let apps = mic_users(me).unwrap_or_default();
+            if devices.is_none() {
+                devices = enumerator().ok();
+            }
+            let apps = match devices.as_ref().map(|en| mic_users(en, me)) {
+                Some(Ok(apps)) => apps,
+                // the audio service may have restarted: start over next time
+                Some(Err(_)) => {
+                    devices = None;
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
             if apps.is_empty() {
                 on_for = 0;
                 off_for += 1;
@@ -66,11 +79,14 @@ pub fn start(app: AppHandle) {
     });
 }
 
+pub fn enumerator() -> windows::core::Result<IMMDeviceEnumerator> {
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+}
+
 /// Names of the processes (other than us) with an active capture session.
-pub fn mic_users(me: u32) -> windows::core::Result<Vec<String>> {
+pub fn mic_users(en: &IMMDeviceEnumerator, me: u32) -> windows::core::Result<Vec<String>> {
     let mut out = Vec::new();
     unsafe {
-        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let devices = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
         for i in 0..devices.GetCount()? {
             let Ok(dev) = devices.Item(i) else { continue };
@@ -124,6 +140,7 @@ mod tests {
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
         }
-        println!("mic users: {:?}", super::mic_users(std::process::id()).unwrap());
+        let en = super::enumerator().unwrap();
+        println!("mic users: {:?}", super::mic_users(&en, std::process::id()).unwrap());
     }
 }

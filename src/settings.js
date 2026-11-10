@@ -24,7 +24,12 @@ const ST = HE
       title: 'Radio Widget — הגדרות',
       countries: 'מדינות',
       volume: 'ווליום',
+      general: 'כללי',
       update: 'עדכון',
+      hotkey: 'קיצור מקלדת להצגה / הסתרה',
+      hotkeyOff: 'כבוי',
+      hotkeyHint: 'מביא את הווידג׳ט לחזית, או מסתיר אותו כשהוא בפוקוס',
+      hotkeyTaken: 'הקיצור תפוס על ידי תוכנה אחרת',
       search: 'חיפוש מדינה',
       stations: (n) => `${n} תחנות`,
       keepOne: 'צריך להשאיר לפחות מדינה אחת',
@@ -48,7 +53,12 @@ const ST = HE
       title: 'Radio Widget — Settings',
       countries: 'Countries',
       volume: 'Volume',
+      general: 'General',
       update: 'Update',
+      hotkey: 'Show / hide shortcut',
+      hotkeyOff: 'Off',
+      hotkeyHint: 'Brings the widget to the front, or hides it when it has the focus',
+      hotkeyTaken: 'Another app is using this shortcut',
       search: 'Search countries',
       stations: (n) => `${n} stations`,
       keepOne: 'Keep at least one country',
@@ -95,6 +105,7 @@ const countryName = (cc) => (regionNames && regionNames.of(cc)) || cc;
 const ui = { tab: 'countries', order: [], counts: null };
 let settings = {};
 let updateInfo = { state: 'idle', version: null, percent: 0, current: '', portable: false };
+let activeHotkey = null; // the shortcut Windows actually gave us, e.g. "Ctrl+Alt+R"
 
 const search = $('#countrySearch');
 const list = $('#countryList');
@@ -127,6 +138,7 @@ function render(keepScroll = false) {
   $('.tab[data-tab="update"]').classList.toggle('dot', hasUpdate);
   if (ui.tab === 'countries') renderCountries(keepScroll);
   else if (ui.tab === 'volume') renderVolume();
+  else if (ui.tab === 'general') renderGeneral();
   else renderUpdate();
 }
 
@@ -190,7 +202,11 @@ async function toggleCountry(cc) {
 
 function apply(patch) {
   Object.assign(settings, patch);
-  window.radio.setSettings(patch);
+  window.radio.setSettings(patch).then((r) => {
+    if (!r || !('hotkey' in patch)) return;
+    activeHotkey = r.hotkey || null;
+    render(true);
+  });
   render(true);
 }
 
@@ -239,6 +255,36 @@ function renderVolume() {
     return box;
   };
   page('volume').replaceChildren(block(ST.ads, 'adDuck', 'adLevel'), el('div', 'set-sep'), block(ST.calls, 'callDuck', 'callLevel'));
+}
+
+// ---------- general ----------
+// Ctrl+Alt+R is also AltGr+R on many keyboard layouts, so it can be changed or
+// turned off. "auto" (the default) takes the first of the two that's free.
+const HOTKEYS = [
+  ['ctrl+alt+r', 'Ctrl+Alt+R'],
+  ['ctrl+shift+alt+r', 'Ctrl+Shift+Alt+R'],
+];
+function renderGeneral() {
+  const want = settings.hotkey || 'auto';
+  const box = el('div', 'set-block');
+  box.appendChild(el('span', 'set-label', ST.hotkey));
+  const seg = el('div', 'seg wide');
+  const option = (id, label, on) => {
+    const b = el('button', '', label);
+    b.dir = 'ltr';
+    b.setAttribute('aria-pressed', String(on));
+    b.addEventListener('click', () => apply({ hotkey: id }));
+    seg.appendChild(b);
+  };
+  // the chosen one, or under "auto" the one that was free
+  for (const [id, label] of HOTKEYS) option(id, label, want === id || (want === 'auto' && activeHotkey === label));
+  option('off', ST.hotkeyOff, want === 'off');
+  box.appendChild(seg);
+  const taken = want !== 'off' && !activeHotkey;
+  const hint = el('span', 'set-hint', taken ? ST.hotkeyTaken : ST.hotkeyHint);
+  if (taken) hint.classList.add('bad');
+  box.appendChild(hint);
+  page('general').replaceChildren(box);
 }
 
 // ---------- update ----------
@@ -303,7 +349,7 @@ window.addEventListener('keydown', (e) => {
   document.documentElement.dir = HE ? 'rtl' : 'ltr';
   search.placeholder = ST.search;
   const tabs = $('.tabs');
-  for (const id of ['countries', 'volume', 'update']) {
+  for (const id of ['countries', 'volume', 'general', 'update']) {
     const b = el('button', 'tab', ST[id]);
     b.dataset.tab = id;
     b.setAttribute('role', 'tab');
@@ -312,6 +358,7 @@ window.addEventListener('keydown', (e) => {
   }
   const [init, upd] = await Promise.all([window.radio.init(), window.radio.updateState()]);
   settings = init.settings;
+  activeHotkey = init.hotkey || null;
   if (upd) updateInfo = upd;
 
   // selected countries first, then the rest by name

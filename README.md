@@ -10,7 +10,7 @@ A small internet radio widget for Windows. It plays thousands of stations from [
   <img src="docs/history-v0.5.4.png" alt="Recently played list" width="470">
 </p>
 
-Built with [Tauri 2](https://tauri.app). The backend is Rust and the UI runs in WebView2, which ships with Windows. The installer is about 1.4 MB. In Task Manager the widget (with its WebView2 processes) uses about 30 MB while it sits in the tray, and more while it's on screen.
+Built with [Tauri 2](https://tauri.app). The backend is Rust and the UI runs in WebView2, which ships with Windows. The installer is about 2.7 MB. In Task Manager the widget (with its WebView2 processes) uses about 30 MB while it sits in the tray, and more while it's on screen.
 
 ## Download
 
@@ -35,20 +35,20 @@ Get the latest `RadioWidget_x.y.z_x64-setup.exe` from [**Releases**](https://git
 | **Recently played** | The clock button lists the last 10 songs with time, artist and station. A song is added once it has played for 20 s, so jingles and quick switches stay out. Click a row to copy it, or its Spotify icon to open it |
 | **Quieter ads** | When the station marks an ad break (an ad-server marker, or a title that is only "Advertisement" / "פרסומות" and the like), the volume fades to 30/50/70% of the current volume and comes back when the music returns. Talk, empty titles and the station name never count as ads |
 | **Quieter calls** | While another app (Teams, Zoom, WhatsApp, Discord…) uses the microphone, the volume fades to 30/50/70% of the current volume and comes back when the call ends. Moving the volume or clicking the "volume lowered" line during an ad or call restores it until that ad break or call is over. For full control, set Windows' Sound → Communications to "Do nothing" so Windows doesn't also lower the radio |
-| **Ctrl+Alt+R** | Brings the widget to the front, or hides it if it already has focus. Falls back to Ctrl+Shift+Alt+R if Ctrl+Alt+R is taken |
+| **Ctrl+Alt+R** | Brings the widget to the front, or hides it if it already has focus. Falls back to Ctrl+Shift+Alt+R if Ctrl+Alt+R is taken. Settings → General picks one of the two or turns it off |
 | **Positions** | Each mode remembers its own screen spot |
 | **Random station** | The shuffle button next to play picks a station at random from any of the countries, skipping ones it picked recently. The flag and station list follow it to its country |
-| **Dead stations** | A station that hasn't started playing within 15 s, whose stream fails, or that goes silent for 5 s after it did start, is skipped for a random station, with a short message saying so. After 5 dead stations in a row it stops and shows the error. Nothing is skipped while Windows has no network |
-| **Updates** | About 15 s after launch, and once a day while it runs, the app checks GitHub for a new release. When there is one, a green dot appears on the tray icon and a Windows notification asks (once per version) whether to update now. Update downloads the installer, updates in place and starts the widget again; Later leaves the dot and a "● Update now to version x.y.z" item in the tray menu for later. Your settings stay. The update is only installed if its signature matches the key built into the app. "Check for updates" in the tray checks right away and always answers with a notification: the update, "latest version", or a failed check with Retry. The portable exe can't update itself: it opens the release page instead |
+| **Dead stations** | A station that hasn't started playing within 15 s, whose stream fails, or that goes silent for 5 s after it did start, is reconnected twice and then skipped for a random station, with a short message saying so. The random one is a stand-in: your own station stays saved and is back on the next start. After 5 dead stations in a row the widget returns to your station, shows the error, and quietly retries once a minute for a while. Nothing is skipped while Windows has no network; playback resumes when it's back |
+| **Updates** | About 15 s after launch, and once a day while it runs, the app checks GitHub for a new release. When there is one, a green dot appears on the tray icon and a Windows notification asks (once per version) whether to update now. Update downloads the installer, updates in place and starts the widget again; Later leaves the dot and a "● Update now to version x.y.z" item in the tray menu for later. Your settings stay. The update is only installed if its signature matches the key built into the app. A background check that fails is tried again after 5 minutes (then less often, up to an hour). If an update can't be installed, a notification offers the download page. "Check for updates" in the tray checks right away and always answers with a notification: the update, "latest version", or a failed check with Retry. The portable exe can't update itself: it opens the release page instead |
 | **Favorites** | ★ on a station row or next to the station name. Favorites appear at the top of the station list, whatever country is selected |
-| **Countries** | 🇮🇱 🇺🇸 🇬🇧 🇨🇦 🇦🇺 🇮🇪 🇳🇿 🇿🇦 to start with. Add or remove any country in Settings → Countries (every country that has stations is listed, with a search box) |
-| **Settings** | The gear button left of the volume (expanded mode), or "Settings…" in the tray menu, opens a small settings window: your countries, the ad and call volume, and updates (check, see the result, update now). Click the gear again to close it. The window is created when opened and destroyed when closed, so it uses no memory in between |
+| **Countries** | Your own country (from the Windows region setting) and 🇺🇸 🇬🇧 🇨🇦 🇦🇺 🇮🇪 🇳🇿 🇿🇦 to start with. Add or remove any country in Settings → Countries (every country that has stations is listed, with a search box) |
+| **Settings** | The gear button left of the volume (expanded mode), or "Settings…" in the tray menu, opens a small settings window: your countries, the ad and call volume, the show / hide shortcut (General), and updates (check, see the result, update now). Click the gear again to close it. The window is created when opened and destroyed when closed, so it uses no memory in between |
 | **Song info** | Read from ICY stream metadata through the local proxy (iHeart's extended `text="…"` titles included). Stations that send nothing, only filler text, or titles their server already turned into "???", show "Station doesn't share song info" (in Hebrew when Windows is set to Hebrew) |
 
 The pointer resting on the widget counts as use, so the widget won't collapse under the cursor.
 Timings are at the top of `src/renderer.js` (`IDLE_TO_COMPACT_MS`, `IDLE_TO_LOGO_MS`, `LOGO_HOVER_DELAY_MS`).
 
-Settings are stored in `%APPDATA%\com.moshiko.radiowidget\settings.json`.
+Settings are stored in `%APPDATA%\com.moshiko.radiowidget\settings.json`. The copy from the save before is kept next to it as `settings.json.bak` and is used if the file is ever damaged.
 ## Development
 
 You need:
@@ -66,9 +66,10 @@ npm run build    # writes the NSIS installer to src-tauri/target/release/bundle/
 
 ## Releasing
 
-1. Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`.
+1. Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json` (the release build fails if they differ).
 2. Write the release's changes in `.github/release-notes/vX.Y.Z.md` (optional). If you retake the screenshots, save them under new names (GitHub caches README images by URL).
-3. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+3. If the change touches updating, startup or exit: install the previous release, build this one, and check that the in-app update from the old version finishes and restarts the widget.
+4. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 
 The [Release workflow](.github/workflows/release.yml) tests and builds the app and publishes the installer, the portable exe and `latest.json` to Releases. `latest.json` is what installed apps check for updates. It carries the installer's signature, made with the update key in the `TAURI_SIGNING_PRIVATE_KEY` repository secret. The matching public key is in `tauri.conf.json`. If the secret is missing, the release build fails rather than publish an update nobody can install. Keep a copy of the private key: without it, installed apps can't be updated any more.
 
